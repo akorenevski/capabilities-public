@@ -12,12 +12,20 @@ With the capabilities manager installed:
 
 ```sh
 capabilities source add my-capabilities https://github.com/akorenevski/my-capabilities.git
-capabilities install my-notion --source my-capabilities
+capabilities install my-notion --source my-capabilities --allow
 ```
 
-Then `my-notion help` for the full usage contract and `my-notion doctor` to prove the connection. Updates arrive with `capabilities update my-notion`.
+`--allow` is the machine owner's yes to running a capability from a source outside the official catalogue; without it the capability arrives quarantined until they run `capabilities allow my-notion`. Then `my-notion help` for the full usage contract and `my-notion doctor` to prove the connection. Updates arrive with `capabilities update my-notion`.
 
-Each capability reads its own credentials from the machine, never from this repository. For `my-notion`, create an internal integration at [notion.so/my-integrations](https://www.notion.so/my-integrations), connect it to the pages it should reach, and put its token in `~/.config/notion/credentials.env` as `NOTION_TOKEN=...`; `my-notion help` describes connections to more than one workspace.
+Each capability reads its own credentials from the machine, never from this repository. For `my-notion`, create an internal integration for each Notion workspace at [notion.so/my-integrations](https://www.notion.so/my-integrations) and connect it to the pages it should reach. Then, in the project that uses it, declare one connection per workspace and the default one:
+
+```sh
+capabilities enable my-notion --project
+capabilities set my-notion connection work '{"secret_env": "NOTION_WORK_TOKEN", "allow_write": true}'
+capabilities set my-notion setting connection.default work
+```
+
+Put each token in the project's `.env.local` (or `~/.config/my-notion/credentials.env`) as `NOTION_WORK_TOKEN=...`, never on the command line, and run `my-notion doctor`.
 
 ## Authoring
 
