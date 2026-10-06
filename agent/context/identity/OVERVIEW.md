@@ -9,6 +9,8 @@ order: 100
 
 This repository is our own managed capability source, registered with the capabilities manager as `my-capabilities`, and it is also this project's home. Its capabilities are ours and independent; the official catalogue (`ai-cluster-one/capabilities`) is installed from, never forked.
 
+This project owns every capability we author: the ones published here, and those still in the private source `house` until they are cleaned and moved here. Patches we carry on catalogue capabilities belong to the project that runs them; `telegram` is the `comms` project's.
+
 The real folder is `~/dev/my-capabilities`. The manager keeps every source workspace under `~/.capabilities/sources/`, so it reaches this one through the link `~/.capabilities/sources/my-capabilities`. Work, commit and push here. Installed payloads under `~/.capabilities/<name>/` and caches under `~/.cache/capabilities/` are never source.
 
 The project body lives under `agent/` (`body.root`), so this project's capability envelope is `agent/capabilities/`. The root `capabilities/` folder holds capability source bundles only, as `capabilities/<name>/bin/<name>`: the manager's indexer reads every folder there as a capability, so nothing else goes in it.
