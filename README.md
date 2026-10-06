@@ -1,4 +1,4 @@
-# my-capabilities
+# capabilities-public
 
 Capabilities by Alexander Korenevski: self-contained command-line tools for AI agents.
 
@@ -20,8 +20,8 @@ This repository runs on two open tools by Konstantin Žilin and [Cluster One](ht
 With the capabilities manager installed:
 
 ```sh
-capabilities source add my-capabilities https://github.com/akorenevski/my-capabilities.git
-capabilities install my-notion --source my-capabilities --allow
+capabilities source add capabilities-public https://github.com/akorenevski/capabilities-public.git
+capabilities install my-notion --source capabilities-public --allow
 ```
 
 `--allow` is the machine owner's yes to running a capability from a source outside the official catalogue; without it the capability arrives quarantined until they run `capabilities allow my-notion`. Then `my-notion help` for the full usage contract and `my-notion doctor` to prove the connection. Updates arrive with `capabilities update my-notion`.
