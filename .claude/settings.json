@@ -1,0 +1,15 @@
+{
+  "autoMemoryEnabled": false,
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "command": "/bin/bash -lc 'root=$(git rev-parse --show-toplevel 2>/dev/null || pwd); PATH=\"$root/.contextkit/manager:$PATH\" contextkit session-start --host claude'",
+            "type": "command"
+          }
+        ]
+      }
+    ]
+  }
+}

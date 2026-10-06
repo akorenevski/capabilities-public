@@ -1,0 +1,43 @@
+**/__pycache__/
+*.pyc
+
+# ContextKit local and generated files
+.env
+.env.local
+.env.*.local
+.contextkit/generated/
+.contextkit.md
+.claude/rules/CONTEXT.md
+__pycache__/
+.DS_Store
+*.pyo
+
+# Credentials and key material never live in this repo: capability
+# credentials sit in ~/.config/<name>/credentials.env, outside it.
+*.env
+credentials.env
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+*.keychain
+*_token
+*.token
+.netrc
+*.session
+*.session-journal
+
+# Capability runtime state
+*/state/
+capabilities/*/state/
+
+# This machine's Telegram account grant: an account id, not for a public repo
+agent/capabilities/telegram/
+
+*.log
+.idea/
+.vscode/
+*.swp
+*~

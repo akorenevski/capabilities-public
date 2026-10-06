@@ -1,0 +1,102 @@
+# The capability template
+
+What a capability is **comprised of** — the artifact it ships and the envelope it manages. This is the doctrine ([DOCTRINE.md](DOCTRINE.md)) applied to structure: a case study in where each kind of knowledge lives. It is deliberately **abstract** — slots, not any one capability — so a new capability slots in without re-deciding the shape, and `capabilities audit` has a fixed thing to check against. The behavioural invariants and how to validate them live in the doctrine; this file holds the form.
+
+## The mental model: one executable contract, two altitudes
+
+The **script is the sole contract surface**. Everything a capability declares about itself — its domain verbs, its awareness line, its machine-readable manifest, its documentation access, its identifier management, its gate — is a verb on that executable (the contract, [SHEBANG.md](SHEBANG.md#the-contract-verbs)). A capability may ship helper files beside it, but those helpers are part of the installed bundle and are reached through the executable. A consuming project keeps only its envelope: connections, identifiers, references, state, and project-local config. One executable contract, one installed bundle version, no copied engine code.
+
+A capability exists at two altitudes, and the split is the whole point:
+
+- **Global (machine-level)** — declared *just enough to be visible*. One generated skill carries awareness of every installed capability; the full contract loads on demand (`<name> help`). One install per machine.
+- **Project (repo-level)** — *expansion*. A consuming project enables the capability, holds **its** connections and identifiers, and accrues **its** references. Per consuming project.
+
+Global is the introduction; project is the elaboration. A fact lives at exactly one altitude and is never restated at the other (DOCTRINE rules 1–2).
+
+**Neutrality is tiered.** Specifics earn their way *down* the slots; the declaration stays clean.
+
+- The **spec** (the doctrine, this template, [SHEBANG.md](SHEBANG.md)) is **domain-neutral** — slots and rules, no example domain's fingerprints.
+- The **declaration** (the `stub` line, the manifest) is **consumer-neutral** — identical for every project; it names the system and how to load its contract, nothing about any one consumer.
+- The **project envelope** (connections, identifiers, references) is where the **specifics live** — concrete values and the operational model. Domain terms here are not bleed; they are the point.
+
+Neutrality is a property of the declaration, not of the whole capability. (Enforced by DOCTRINE rules 2 and 10.)
+
+## Altitude × register: where anything lives
+
+Two questions place any piece of knowledge, and crossing them leaves no blurry middle:
+
+1. **Altitude** — at what scope is it true? *Framework* (every capability; ships once in the doctrine, this template, the executable standard), *capability* (this tool, every project; ships once in the script and its guides), or *project* (only here; the project envelope).
+2. **Register** — is it *the product* (the knowledge itself, read and consumed) or *the meta* (how to author the product)?
+
+|  | The product — read and consumed | The meta — how to author it |
+|---|---|---|
+| **Framework** — every capability | *(none — the framework is meta)* | the doctrine, this template, [SHEBANG.md](SHEBANG.md); the manager guides surfaced by `capabilities guide [topic]` |
+| **Capability** — this tool, every project | the CLI + `<name> help`; the `stub` line | the **guide** — `<name> guide [topic]`, fetched live (DOCTRINE rule 14) |
+| **Project** — only here | connections + identifiers (values), references (model), routines (procedure) | *— empty: authoring guidance is never project-specific —* |
+
+The project-meta cell is empty on purpose: authoring guidance never varies by project, so it always rises to one of the two agnostic homes — to **framework** meta when it holds for every capability (*how to write any reference* → this template), or to **capability** meta when it is specific to one tool (*how to author X with this tool* → that capability's guide, DOCTRINE rule 14). What does **not** exist is a *project-altitude* usage-guide: a per-project "how to use this here" file is always really the product (→ connections / identifiers / a reference / a routine) or it rises to one of those two meta homes. Procedure that is *executable* is a **routine**; procedure that is *the tool's surface* is the CLI's `help`; everything declarative and project-specific is a **reference**.
+
+## The slots
+
+| Slot | Lives in | Altitude | Holds |
+|---|---|---|---|
+| The script | `bin/<name>` upstream → registry copy at `~/.capabilities/<name>/<name>`, symlinked onto `PATH` | capability | the executable contract: domain verbs + the contract verbs |
+| The bundle *(opt)* | files beside `bin/<name>` upstream → copied under `~/.capabilities/<name>/` on source-directory install | capability | helper assets, templates, or service engines used by the executable; never copied into consuming projects |
+| The declaration | verbs on the script — `stub`, `manifest --json` — snapshotted by the manager at install | capability | the one-line awareness text; the machine-readable manifest (name, summary, credential scope and keys, docs base, state flag, optional service metadata) |
+| Guides *(opt)* | `guides/<topic>.md` beside the script upstream, listed with title/preview by `<name> guide` and fetched live by topic | capability | consumer-neutral *how to author X with this tool* docs (DOCTRINE rule 14); present only when the tool has authoring depth |
+| Change log | `CHANGELOG.md` beside the script upstream → copied with the bundle to `~/.capabilities/<name>/CHANGELOG.md` | capability | what changed for someone who already holds the capability, read through `capabilities changelog`: one `## YYYY-MM-DD — <what changed>` entry per change they would feel, newest first, its heading unique in the log because the heading is the entry's identity (DOCTRINE rule 12) |
+| Connections | project `capabilities/<name>/connections.json`, else global `$XDG_CONFIG_HOME/<name>/connections.json` — standard envelope (`default` pointer + `connections` map), entry interior capability-owned | project / user | explicitly named endpoints and identities: per-connection non-secret wiring, secrets by env-key indirection, the write gate (`allow_write`) |
+| Service config *(opt)* | `capabilities/<name>/service/` | project | project-local policy/context for a bundled service; `init`/`start`/`run` require explicit project enable, while the engine code runs from the installed bundle and its provider-neutral deployment contract, when present, is declared at `manifest.service.deploy` |
+| Identifiers | `capabilities/<name>/identifiers.json` — CLI-managed envelope, written by `<name> ids set` and rendered by `capabilities ids <name>` | project | the non-secret structural values the CLI **discovered**: ids, labels, classifications, breadcrumbs |
+| References | `capabilities/<name>/reference/*.md` — front-matter envelope + free prose, surfaced by `<name> refs` | project | the project-specific operational **model**: mappings, treatments, what output means here |
+| State | `capabilities/<name>/state/` or `$XDG_STATE_HOME/<name>/`, per declared scope | project / user | what credentials mint: sessions, caches, pending logins. Never committed (DOCTRINE rule 16) |
+| Deviations *(opt)* | `deviations.md` beside the script upstream | capability | recorded, justified departures from the standard, kept apart so an audit reads them as choices |
+
+The project envelope's resting state is **empty**: `capabilities enable <name> --project` writes the gate entry and nothing else. Every connection-bearing capability must resolve an explicit registry, but that registry may be global, so project enable does not invent a project copy. Identifiers appear when the CLI discovers them, references when genuine project context accrues. An empty capability directory is conformant when its registry resolves globally.
+
+`capabilities/` is the canonical project envelope. The shared runtime can read the legacy `.capabilities/` location until the manager migrates it. `capabilities init` preflights the complete move, merges disjoint gate entries and gitignore lines, and refuses content collisions without partially changing either tree.
+
+## How each altitude reaches the agent
+
+The capability declares itself host-neutrally; the **manager owns capability-context composition**, while one selected project context owner owns host injection (DOCTRINE rule 13). For the Claude Code host:
+
+- **Global — the carried skill.** The `skill/SKILL.md` release asset, placed at `~/.capabilities/.manager/skill/SKILL.md` by the manager's own bootstrap and symlinked to `~/.claude/skills/capabilities/` for Claude Code and `~/.agents/skills/capabilities/` for Codex; `capabilities skill` places and relinks it on demand. It is an introduction only — what the manager is and the three commands that reach everything else — so it is byte-identical on every machine. Naming a capability reaches it through the word *capability* in its description; a capability already enabled in a project is announced by its own stub line in that project's context, so the global surface never enumerates a machine's installed set.
+- **Project — the manager-owned block.** `capabilities context --fragment` composes host-neutral Markdown from effective project/global policy, registry snapshots, and project knowledge: the manager intro plus, per enabled capability, the stub line, identifiers pointer, references menu, and discovery pointers. Connection topology stays on the executable's local `<name> connections` surface and health stays on `<name> doctor`; neither is copied into always-loaded context. Composition is files-only and degradation is per-capability, never whole. In a standalone Claude project, `capabilities context --claude`, wired by `capabilities init` as the project's single `SessionStart` hook line, places that block at `.claude/rules/CAPABILITIES.md`.
+- **Project prompt override.** The generated rule includes a short agent instruction paragraph; by default it teaches identifier persistence. A project may override that paragraph with `CAPABILITIES_CONTEXT_PROMPT` in `.env.local` or `.env`; absent the variable, the default is used.
+- **ContextKit ownership.** A project bound by `.contextkit/config.toml` delegates host injection to ContextKit. ContextKit invokes `capabilities context --fragment` and inserts the returned manager-owned block verbatim into its combined Claude/Codex context; it does not read the capability gate, snapshots, or envelopes to invent its own index. In that project `capabilities init` keeps envelope/global-skill setup but creates no host hooks or standalone capability context, retires legacy capabilities-owned wiring by generation marker, and preserves ContextKit-authored or unrelated host configuration. The host-writing context modes return the `contextkit build` handoff without writing.
+- **CLI on `PATH`** — the host-neutral third route: the registry copy is symlinked onto `PATH`, so any session invokes `<name>` directly. A consuming project never copies the CLI.
+
+Through that same CLI route a capability's **guides** reach the agent: `<name> guide [topic]` resolves against the capability's declared docs base and prints the doc, fetched **live** (the request, cache, and fallback mechanics are the executable standard's — [SHEBANG.md](SHEBANG.md#guides)). A guide is never copied into a consuming project; a project's reference points to it by role (DOCTRINE rule 14).
+
+The Codex host swaps the placement, not the composition: the same artifact, reached through its own skill root, and `capabilities init --codex` wires `.codex/config.toml`, `.codex/hooks.json`, `.codex/generated/capabilities.md`, and the root `.capabilities.md` link Codex loads it through (DOCTRINE rule 13). Host wiring is manager-owned; every `capabilities init --codex` refreshes the hook and config to the canonical form. `capabilities context --codex` refreshes the capabilities fragment and repairs the link and its config entry. No hand-authored project-root instruction markdown file is required or assumed. Another host swaps the injection while the registry and the CLI-on-`PATH` route stay the same.
+
+## Connections vs identifiers vs reference
+
+The project homes split by **provenance and shape**:
+
+- **connections — the explicitly declared endpoints and identities, plus their chosen behaviour.** Each entry carries its non-secret wiring literally, names its secrets by env-key indirection, and may carry the write gate and behavioural keys; a `default` pointer names which entry an unflagged invocation uses. The executable alone renders and resolves this capability-owned interior through `<name> connections`; the manager does not duplicate it into generated context. Written at configuration time, by whoever configures.
+- **identifiers — the values the CLI discovered.** Discrete, lookup-able structural facts: ids, codes, account handles, labels, classifications, and breadcrumbs for values not yet pinned. The answer to *"what is the handle for X?"* Thin standard envelope (`{label: {value, note}}`) so the manager renders every capability's menu without understanding any of them; the CLI writes through `<name> ids set`. No prose narrative, no treatment (DOCTRINE rule 4).
+- **reference — the model and context.** The prose that is neither a value nor a step: how the system behaves, what its output represents, the mapping or treatment the consumer applies. The answer to *"how does this work, what does it mean, how is it handled?"* Domain-specific terms belong here freely — this is the slot that holds them.
+
+Connections vs identifiers is a provenance split — connections are the values someone *chose*, identifiers the values the CLI *discovered*; different writer, different cadence, different git-diff meaning — never merged. The line for the rest: a **value** is a connection's or an identifier's; an **explanation or model** is a reference's; a **step-by-step to perform a task** is a routine's — never a reference's (DOCTRINE rule 11).
+
+## References: the envelope and growth
+
+A reference is a markdown file in the capability's `reference/` folder (`capabilities/<name>/reference/` — the single home for references, kept apart from the JSON config files), carrying a two-key front-matter envelope:
+
+```markdown
+---
+name: <kebab-slug>
+description: <one line — what this reference holds>
+---
+```
+
+`<name> refs` and the context build read only the front-matter; the body is free prose, loaded on demand. References are **per-topic files by design**: growth adds a sibling file with its own front-matter, and the menu grows with it — no index file to maintain, no slot to branch. The front-matter `description` is load-bearing the way a skill description is: it is how an agent decides whether to load the body.
+
+## Credentials at install
+
+The manifest declares each credential key as `{key, secret, required, note}` and the capability's **scope** (`project` / `user`). `capabilities install` scaffolds accordingly — the key names with empty values land in the scope's home (project `.env` / user `credentials.env`), placeholders never secrets (DOCTRINE rule 6):
+
+- A **required** key left empty is dysfunction `doctor` names at use-time — the remediation is discovered from the tool, not asserted in a doc.
+- An **optional** key scaffolds as a breadcrumb: the empty key sits in its proper place with its note nearby, so a future need stumbles on it with context.
+- A declared **post-install** step (e.g. a login ceremony) is offered at install, idempotent, never forced.

@@ -1,0 +1,13 @@
+{
+  "capabilities": {
+    "askproject": {
+      "enabled": true
+    },
+    "tasks": {
+      "enabled": true
+    },
+    "telegram": {
+      "enabled": true
+    }
+  }
+}

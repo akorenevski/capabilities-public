@@ -1,0 +1,724 @@
+# The shebang CLI
+
+What a capability's **executable** is comprised of — the code shape every `bin/<name>` fills. The executable is the capability's public contract: one self-contained CLI carrying its domain verbs and the **contract verbs** that make it self-describing and self-gating. A capability may also ship a bundle of helper files beside the executable, but those helpers are reached through the CLI's declared surface, not copied into consuming projects as engine code. This file is the contract's specification — the verbs and their output shapes, the shared code patterns (the project walk, the gate, the credential cascade, connection selection, state resolution), the I/O envelope, and the exit codes. The behavioural invariants — the credential cascade, identity-freedom, discoverable knowledge, host-neutrality — and how to validate them live in the doctrine ([DOCTRINE.md](DOCTRINE.md)); this file holds the **code patterns that realize them**, distilled from the CLIs that already embody them so a new executable slots in without re-deriving the house style.
+
+A capability's CLI is the **only** thing a consuming project runs — symlinked onto `PATH` by the manager, knowing nothing of hosts or sibling capabilities — so its surface, its contract, and its failure behaviour are the capability's public API. The patterns below are what make that API uniform across every tool an agent picks up.
+
+## One executable, `uv run`, PEP-723
+
+The executable is a single script with its dependencies declared inline, run by `uv` with no venv to provision and no install step. Most capabilities stop there. When a capability needs helper assets, templates, or a service engine, those ship as an installed bundle beside the executable; the executable remains the stable contract and dispatch point. Every CLI opens identically:
+
+```python
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "httpx>=0.27",
+# ]
+# ///
+```
+
+The `-S` passes `--script` through `env`; the `# /// script` block is PEP-723 inline metadata `uv` reads to build an ephemeral environment. One file is the whole program — copyable, symlinkable, with no sibling `requirements.txt` or lockfile to keep in sync. Dependencies stay minimal: an HTTP CLI needs only `httpx`; reach for a protocol-specific client only when the protocol genuinely demands it.
+
+## The contract verbs
+
+Every script implements the same contract verbs alongside its domain verbs. This document is the contract specification, and it is a **spec, never a shared runtime library**: each script realizes it by copying the patterns in this file, and `capabilities audit` verifies conformance by calling the verbs and validating output shapes. No script imports from the manager, so a manager update can never break a deployed script.
+
+| Verb | Returns |
+|---|---|
+| `help` | The full usage contract (the module docstring), verbatim. |
+| `doctor` | The cheapest authenticated round-trip, per connection; proves credentials, reachability, identity. |
+| `connections` | The resolution report: every connection, every value, its winning tier and source, secrets masked. Local only — no network. |
+| `stub` | The one-line awareness text. |
+| `manifest --json` | The machine-readable declaration (schema below). |
+| `guide` / `guide <topic>` | The shipped guide menu with previews / one guide's body, fetched live from the docs base. |
+| `ids list\|get\|set\|rm` | The project identifiers envelope, managed. |
+| `refs` | The menu of the project's reference files, from front-matter. |
+| `inventory` | What the capability holds in this project: headline metrics and the things inside. Local only by default — no network, no writes. |
+
+The declaration facts feed the contract from **constants at the top of the script** — one home each. Guide topics are the exception: their one home is the set of shipped Markdown filenames. Contract verbs render from these sources so they cannot disagree with one another:
+
+```python
+NAME = "asana"
+SUMMARY = "Asana CLI over the REST API — list/read/create tasks, comment, complete."
+SCOPE = "project"   # credential scope: "project" | "user"
+CRED_KEYS = [
+    {"key": "ASANA_TOKEN", "secret": True, "required": True, "note": "personal access token"},
+]
+WRITE_VERBS = {"create", "comment", "complete"}   # domain verbs that mutate the remote system
+WRITE_DEFAULT = True    # a connection's allow_write when its entry is silent; False when writes leave the system
+DOCS_BASE = "https://raw.githubusercontent.com/<org>/capabilities/main/capabilities/asana/guides/"
+STATE = False       # True when the capability writes session/cache state
+INVENTORY = None    # or {"network": "none"|"optional"|"required"} with an _inventory(network) builder
+POST_INSTALL = []   # [{"cmd": …, "note": …}] steps the manager offers at install
+SERVICE = None      # or {"name", "summary", "verbs", ...} when a bundled service ships
+```
+
+## Agent-first help is the surface
+
+`<name> help` prints a hand-written usage contract that is the **single source of truth** for the surface (DOCTRINE rule 3 — discoverable knowledge lives in the tool, not in docs that go stale). It is the module docstring, emitted verbatim:
+
+```python
+if args.cmd == "help":
+    sys.stdout.write((__doc__ or "").lstrip("\n")); return
+```
+
+The docstring carries everything an agent needs to drive the tool without reading the source: a one-line statement of what the CLI is and that it is agent-invoked, the credential keys it resolves, every subcommand with its arguments and flags — the contract verbs included — the I/O contract, and the exit-code table. It is written *for an agent loading it on demand* — prescriptive, exhaustive, structured with visual headers — not as terse `--help` output. A stateful CLI (one with a login ceremony) opens its help with the startup protocol the agent must follow (`<name> doctor` first, what each exit code means, how to recover).
+
+When the help text outgrows the docstring, it may live in a `HELP` constant printed the same way; the contract is identical — `<name> help` is the canonical surface, and nothing about a command is documented anywhere a `<name> help` could have answered.
+
+## `stub` — the awareness line
+
+`<name> stub` prints the one-line awareness text a host injects into sessions: the `SUMMARY`, closed by the discovery pointer.
+
+```python
+if args.cmd == "stub":
+    _emit(f"{SUMMARY} Run `{NAME} help`."); return
+```
+
+```
+Asana CLI over the REST API — list/read/create tasks, comment, complete. Run `asana help`.
+```
+
+The line is awareness, not a promise the tool is usable here — readiness is `doctor`'s question. It carries no project specifics, no front-matter, nothing the tool itself answers.
+
+## `manifest --json` — the declaration
+
+`<name> manifest --json` prints the machine-readable declaration, rendered verbatim from the constants (`--json` is accepted for explicitness; the output is always this JSON):
+
+```json
+{
+  "name": "asana",
+  "summary": "Asana CLI over the REST API — list/read/create tasks, comment, complete.",
+  "credentials": {
+    "scope": "project",
+    "keys": [
+      { "key": "ASANA_TOKEN", "secret": true, "required": true, "note": "personal access token" }
+    ]
+  },
+  "docs": {
+    "base": "https://raw.githubusercontent.com/<org>/capabilities/main/capabilities/asana/guides/",
+    "topics": ["authoring", "boards"]
+  },
+  "state": false,
+  "inventory": { "network": "optional" },
+  "post_install": [],
+  "service": {
+    "name": "assistant",
+    "summary": "Project-local assistant daemon using the bundled service engine.",
+    "verbs": ["init", "doctor", "run", "start", "stop", "status", "logs"],
+    "deploy": {
+      "schema": "capabilities.service.deploy.v1",
+      "default_policy": "auto",
+      "command": ["asana", "service", "run"],
+      "environment": {
+        "required": ["ASANA_SERVICE_TOKEN"],
+        "optional": [{"key": "ASANA_SERVICE_MODE", "default": "worker"}]
+      },
+      "mounts": [
+        {"name": "asana_state", "kind": "state", "target": "{agent_home}/.local/state/asana"},
+        {"name": "codex_state", "kind": "shared", "target": "{agent_home}/.codex"}
+      ],
+      "restart": "unless-stopped",
+      "doctor": ["asana", "service", "doctor"]
+    }
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `name`, `summary` | The constants, verbatim. |
+| `credentials.scope` | `project` or `user` — where the secret lives (see [the credential cascade](#the-credential-cascade)). |
+| `credentials.keys[]` | Every key the cascade resolves: `key`, `secret`, `required`, `note`. Install scaffolding and `doctor`'s remediation both derive from this list. |
+| `docs.base` | The upstream guides base URL; `""` when no guides ship. Overridable through the cascade as `<NAME>_DOCS_BASE`, so storage can move without touching the contract. |
+| `docs.topics` | The sorted stems of the shipped `guides/*.md` files; `[]` when no guides ship. |
+| `state` | `true` declares the capability writes session/cache state (see [state](#state)). |
+| `inventory` | `null` when the capability reports nothing of its own; otherwise `{ "network": "none" \| "optional" \| "required" }` — how much of its report needs the remote system (see [inventory](#inventory--what-the-capability-holds-here)). |
+| `post_install[]` | `{ "cmd", "note" }` steps the manager **offers** at install — idempotent, never auto-run. |
+| `service` *(optional)* | Metadata for a bundled service: at minimum `name`, `summary`, and `verbs[]`. The CLI owns its lifecycle contract under `<name> service ...`. |
+| `service.deploy` *(optional)* | Versioned, provider-neutral deploy descriptor. Its v1 contract declares an argv `command`, service-only `environment.required[]` and optional `{key, default?}` entries, named `state`/`shared` mounts, Compose restart policy, optional doctor argv, and `default_policy` (`auto` or `disabled`). Mount targets are absolute or start with `{agent_home}` / `{project_root}` and are resolved by the consuming runtime. Generic CLI credentials do not become service requirements unless the descriptor declares them. |
+| `service.machine` *(optional)* | Declares that the service also runs once per machine for every project that opted in to it (see [machine mode](#machine-mode)). Its v1 contract (`capabilities.service.machine.v1`) names the argv `command` that runs it in the foreground and the argv `doctor` that proves it, each starting with the capability's name and carrying `--machine`; `projects`, the file under the capability's own config home where it lists the projects that opted in; and optionally `config` and `state`, the machine homes of its settings and its runtime files. Any other key is refused. A capability declaring it lists `join` and `leave` among its service verbs. The manager validates it during audit, source check, and install. |
+
+`default_policy: "auto"` makes an explicitly project-enabled capability eligible
+when the deployment runtime's `service_policy.auto_include` is true. `disabled`
+requires that runtime to name the capability with an `enabled` override. Neither
+value authorizes a service: explicit project capability enablement remains the
+outer gate. The manager validates v1 descriptors during audit, source check, and
+install; capabilities without `service` or without `service.deploy` remain valid.
+
+## Guides
+
+`<name> guide` prints a JSON list derived from the shipped `guides/*.md` files;
+`<name> guide <topic>` prints one guide's body. Every menu entry has exactly
+`topic`, `title`, `preview`, and `command`: the filename stem supplies the topic,
+the first H1 supplies the title, the first prose paragraph supplies the preview,
+and the CLI constructs the read command. No front matter or separately maintained
+topic list exists. A capability with guides therefore ships the full bundle.
+
+The script is the **door** to the docs, never the authoritative storage: the
+menu is computed from what the capability ships so it cannot drift, and a body
+resolves **live** against the declared base so an upstream edit reaches every
+consumer at once.
+
+```json
+[
+  {
+    "topic": "boards",
+    "title": "Working with Asana boards",
+    "preview": "How this capability discovers sections and moves tasks between them.",
+    "command": "asana guide boards"
+  }
+]
+```
+
+Resolution order, per topic:
+
+1. **Conditional GET** `{DOCS_BASE}{topic}.md` — `If-None-Match` with the cached ETag when one exists; a short timeout (10s), no retries.
+2. **200** → print the body; write body + ETag to the cache. **304** → print the cache.
+3. **Network failure or 5xx** → print the cache, with a one-line staleness warning on stderr. No cache → `_die(5, …)` naming the URL that failed.
+
+The cache is the **offline floor, never the authority**: `$XDG_STATE_HOME/<name>/guides/<topic>.md` (plus `<topic>.etag`) — user-level regardless of credential scope, because guide content is capability-scoped, project-independent, and non-secret.
+
+## `inventory` — what the capability holds here
+
+`<name> inventory` prints what the capability amounts to in **this** project: a few headline metrics and, where they exist, the things behind them. It is the capability's own answer, so a reader assembling a whole project renders every capability through one template and holds no knowledge of any of them.
+
+```json
+{
+  "capability": "<name>",
+  "project": "/path/to/project",
+  "network": false,
+  "metrics": [
+    { "label": "jobs", "value": 8 },
+    { "label": "active here", "value": 6, "note": "environment: development" }
+  ],
+  "items": [
+    { "group": "jobs", "name": "nightly-sync", "state": "enabled",
+      "detail": "0 3 * * *",
+      "attributes": [{ "label": "environment", "value": "production" }] }
+  ],
+  "service": { "state": "running", "detail": "pid 4211" },
+  "deferred": []
+}
+```
+
+Every field is present on every answer, so a consumer never branches on absence. `capability` and `project` say who answered and about where (`project` is `null` outside a project). `metrics[]` are the headline figures, each `{ "label", "value", "note"? }`, rendered in the order given. `items[]` are the things inside, each `{ "name", "group"?, "state"?, "detail"?, "attributes"? }` — `group` sorts an answer that carries more than one kind of thing (scripts and schedules), `state` is one word a reader shows as a chip, `detail` is one line beside the name, and `attributes[]` are further `{ "label", "value" }` pairs. Ordered arrays rather than objects throughout: a reader that decodes JSON into a map loses the author's order, and the order is what makes the rendering legible. `service` is `null` unless the capability ships one, else `{ "state", "detail"? }` — and a capability that ships one always reports it, read from what the service left on this machine, so `capabilities inventory` can carry every declared service's state. `deferred[]` names what this run did not fetch, each `{ "label", "note"? }`.
+
+**The read is local, fast, secret-free, and leaves nothing changed.** No network, no login, no writes — not to the project, not to state, not to a cache. A secret never appears, masked or otherwise; where credentials resolve from is `connections`' question and whether they work is `doctor`'s.
+
+**Network-backed detail is declared and opt-in.** A capability whose figures live in the remote system declares it once, in the `INVENTORY` constant, and the manifest carries the declaration so a caller knows before it asks:
+
+```python
+INVENTORY = {"network": "optional"}   # "none" | "optional" | "required"
+```
+
+`none` — the whole report is local. `optional` — the local report stands on its own and `--network` adds to it. `required` — without `--network` there is nothing local to say. Bare, the verb never reaches the network whatever the mode; what it left behind it names in `deferred`. `<name> inventory --network` is the caller's explicit consent, and only then may the capability make the read remote. The answer always states which it was in its own `network` field.
+
+A capability with nothing of its own to report leaves `INVENTORY = None` and answers the same envelope, empty. That absence is the contract, not a gap.
+
+The envelope, the flag parsing and the empty answer are vendored in the contract preamble; a capability that declares `INVENTORY` supplies `_inventory(network: bool) -> dict` beside its `_cmd_connections`, returning any of `metrics`, `items`, `service`, and `deferred`.
+
+`inventory` is an **operational** verb: it reads project content rather than the capability's own declaration, so the policy gate applies to it exactly as it applies to `refs` and `ids` ([the capability policy gate](#the-capability-policy-gate)). The safe-discovery set stays `help`, `stub`, `manifest`, `connections`.
+
+## Project records and the envelope
+
+Every project has a visible `capabilities/` envelope. `capabilities/project.json` gives the project its slug, holds its durable id (resolved as described below), and selects where live configuration is kept with `"store": "files"` or `"store": "db"`; absence preserves files mode. The project identity is the bootstrap fact that selects the records adapter, and the policy gate then comes through that adapter with every other live record. `CAPABILITIES_STORE_MODE` is a diagnostic override, not project doctrine.
+
+All runtime readers open the same records adapter. Files mode maps logical collections onto the established envelope and `$XDG_CONFIG_HOME` layout. Database mode reads the same collections from the configured store (local SQLite by default, selected by the manager's store URL resolution). Project records resolve before global records; merge collections compose by key, and a connection identity is always taken whole from one scope rather than assembled field by field. A call site asks for a collection and never branches on the backend.
+
+In files mode, project material has this layout:
+
+```
+capabilities/
+  project.json        # durable project identity and files/db selection
+  settings.json       # policy records in files mode
+  <name>/
+    connections.json  # connection, grant, and default-setting records
+    identifiers.json  # identifier records, managed by the ids verbs
+    reference/        # one front-matter .md per reference in files mode
+      *.md
+    service/          # project-local service settings/context in files mode
+    state/            # capability-written; never committed
+```
+
+In database mode those logical records and document bodies, including the policy gate, live in the store; the envelope still holds project identity, the state guard, and source-owned project material that is not a live record.
+
+**The machine's store setting is the one store pointer.** `capabilities store set` records it and is its only writer: the non-secret values — host, port, database, user, an `sslmode` of `require` or stronger, and an optional root certificate — in `$XDG_CONFIG_HOME/capabilities/store.json`, and the password in the manager's own credentials tier, `$XDG_CONFIG_HOME/capabilities/credentials.env`, at mode 0600, taken from stdin, a file or a named environment variable and never from argv. The manager's store URL resolution takes `CAPABILITIES_STORE_URL` when it is set, for tests and development sessions, else the setting, else the local default. A capability reads the setting from the manager's files through the store tier's `read_store_setting()`, which writes nothing. `capabilities store show` reports the setting without its secret, and `capabilities store doctor` proves that a TLS connection works and that a plain-text one is refused.
+
+`capabilities/` is canonical and intentionally visible so the project's context
+owner and humans share one project body. The runtime also reads a legacy
+`.capabilities/` tree until `capabilities init` migrates it. Migration is
+manager-owned and preflighted: disjoint gate entries and gitignore lines merge;
+any other content collision stops before either tree changes. Capability scripts
+never migrate.
+
+**Where the envelope sits is resolved, not assumed.** A project bound by
+`.contextkit/config.toml` has a context owner that owns its visible body, so the
+runtime asks it — `contextkit path capabilities`, run in the project root,
+printing the absolute envelope path — and everything derived from the envelope
+follows that answer: the project identity, the manager-owned `.gitignore`, per-capability
+identifiers, references, connections, and state. `$CAPABILITIES_PROJECT_ENVELOPE`
+supplies the same answer in advance, so a context owner composing through
+`capabilities context --fragment` is never called back mid-compose. Resolution is
+filesystem-cheap and leaves the project untouched: at most one lookup per
+invocation, cached per project root, and never during project-root discovery.
+Every other case — no `.contextkit/config.toml`, no `contextkit` on `PATH`, a
+failing command, or output that is not an absolute path inside the project —
+keeps the envelope at `<root>/capabilities`, so a project without a context owner
+depends on nothing but itself.
+
+**A resolved answer is recorded, and stands only while its inputs do.** The
+manager writes one entry per absolute project root at
+`$XDG_CACHE_HOME/capabilities/envelope/`, holding the resolved envelope, the size
+and modification time of every input that answer consulted — the project's
+`.contextkit/config.toml` and the context owner's own program — and a coarse
+expiry bounding what a stat cannot see. A capability CLI and the manager both
+read it, re-observing each named input and comparing it whole, so an ordinary
+call resolves the envelope in one small read rather than two interpreter starts.
+Anything in doubt — an unreadable file, an unexpected shape, a moved input, a
+passed expiry — resolves again from the context owner, so the failure mode is
+slow and never wrong. `$CAPABILITIES_PROJECT_ENVELOPE` outranks the record and is
+never written into it. The manager is the record's only writer and replaces
+entries atomically, because capability CLIs run concurrently; the record is
+reconstructible from nothing, so deleting it costs one resolution.
+
+**The project id is resolved beside the envelope.** In a project bound by `.contextkit/config.toml` the id belongs to ContextKit: `contextkit identity show --json --project <root>` answers it, a non-null `config` saying the project is bound and a non-null `id` being authoritative; a ContextKit that has no `identity` verb holds no id, which reads as a null one. There `project.json` holds at most a copy of that id: the manager fills a missing copy from ContextKit, never mints or rewrites one, and writes no `project.json` at all while ContextKit has no id, because `contextkit identity adopt` reads an absent file as no id yet and refuses one that carries none. Without the binding the id is `project.json`'s own, minted once by `capabilities init`. The answer is in one of four states: `unbound` (project.json's id), `pending` (bound, and ContextKit has no id yet, so an existing project.json id is used, which is the id `contextkit identity adopt` takes), `adopted` (ContextKit's id) and `mismatch` (project.json holds a different id, and ContextKit's is used). A write that stamps the id, such as a record a capability attributes to the project or a store registration, takes it only when it is verified for that invocation and otherwise exits 6: a mismatch names both ids, a bound project with no id anywhere names `contextkit identity adopt`, and a ContextKit that cannot answer is named as such. Reads never refuse over the id: they take it in every state, a ContextKit that cannot answer leaving them on project.json's id, and a read path that would register the project leaves the registration out where the id may not be stamped. The manager never runs `contextkit identity adopt`. `capabilities doctor` reports the state and fails on a mismatch, which is reconciled by hand. The manager records ContextKit's answer the way it records the envelope, one entry per root at `$XDG_CACHE_HOME/capabilities/identity/`, against the same inputs, the binding where ContextKit keeps the id and the program that answered, and never records a failed answer; `capabilities path --json --identity` answers on a miss. A capability reads that record through the contract and asks the manager when the record does not stand. An id a write may stamp is handed down beside the envelope, as `$CAPABILITIES_PROJECT_ID` scoped by `$CAPABILITIES_PROJECT_ID_ROOT` exactly as the envelope handoff is scoped, by every process that resolves the envelope, which resolves the id with it at read level, and by every process the manager launches into a project; in an unresolved, mismatched or id-less state nothing is handed down, and the child resolves on its own; a live handoff for the root outranks ContextKit, so a descendant uses it without asking again.
+
+- **Identifiers** — discoverable, non-secret, structural lookup (DOCTRINE rule 4). In files mode `identifiers.json` is a thin standard envelope — label → `{ value, note }`; in database mode the same entries are identifier records. Any reader renders the same menu without understanding the capability, and capability-specific structure lives inside values:
+
+  ```json
+  {
+    "workspace": { "value": "1199…", "note": "workspace gid" },
+    "sections":  { "value": { "Backlog": "1200…", "Doing": "1201…" }, "note": "board sections" }
+  }
+  ```
+
+  Connections vs identifiers is a **provenance split**: connection entries hold values someone *chose* (wiring, per-connection behavioural keys); identifiers hold values the CLI *discovered*. Different writer, different cadence, different git-diff meaning — never merged.
+
+- **References and service context** — prose by nature (a model, treatment, taxonomy, or prompt), exposed as versioned documents through `<name> context`. Files mode keeps them as `.md` under their established envelope paths; database mode keeps immutable bodies plus the active project/global pin. `<name> context edit <key>` yields an editable path and `<name> context put <key>` publishes it with an optimistic base-version check. `<name> refs` remains the compact reference menu and `<name> context show <key>` returns a body without exposing which backend answered.
+
+  ```markdown
+  ---
+  name: vat-regimes
+  description: How VAT regimes map to income accounts on sales invoices
+  ---
+  ```
+
+  `<name> refs` emits the menu — `[{ "name", "description", "path" }]` — reading front matter without loading unrelated bodies. In files mode `path` is the document path; in database mode it is the corresponding `<name> refs show <key>` command.
+
+The `ids` verbs manage the identifier collection through the adapter:
+
+| Verb | Does |
+|---|---|
+| `ids list` | Prints the resolved small, non-secret lookup. Empty/absent → `{}`. |
+| `ids get <label>` | Prints the value as stored. Unknown label → exit 3. |
+| `ids set <label> <value> [--note <text>]` | Upsert: `<value>` parses as JSON, a non-JSON argument stores as a string; `--note` sets the annotation. |
+| `ids rm <label>` | Removes the label. Unknown label → exit 3. |
+
+`ids set` writes the project scope selected by `project.json`; in files mode it creates `capabilities/<name>/` on demand inside an existing envelope. In a project with no envelope it exits 6, naming `capabilities init` as the remediation.
+
+## The capability policy gate
+
+Operational verbs and `doctor` pass an effective two-scope policy gate before dispatch. Safe discovery verbs — `help`, `stub`, `manifest`, and the local-only `connections` report — remain available so a disabled capability can be understood and configured. The manager owns the policy collection. Files mode maps it to:
+
+1. Project: `capabilities/settings.json`.
+2. Global machine default: `$XDG_CONFIG_HOME/capabilities/settings.json`.
+
+Database mode keeps both scopes as policy rows in the configured store. An explicit project entry wins. An absent project entry inherits the global entry. Absence at both scopes is disabled by default. Policy mutations require explicit `--project` or `--global`; the agent asks the user which scope they mean rather than guessing.
+
+Above both scopes sits the machine ceiling, `$XDG_CONFIG_HOME/capabilities/machine.json`, which only the manager writes and which is never kept in a store, because it answers for this machine alone. Each installed capability is `allowed` or `quarantined` there; a capability without an entry is allowed. Quarantined is effective-disabled in every project and outside any, whatever the project or global entry says: `_gate()` refuses its operational verbs and `doctor` with exit 4 (`quarantined`) before it resolves a project or a policy row, a `--machine` call included, while safe discovery stays available. Allowed leaves the two scopes deciding exactly as below. `capabilities install` writes `quarantined` for a capability new to the machine and `allowed` when given `--allow`; reinstalling or updating keeps the state, and uninstalling drops it. `capabilities allow` and `capabilities quarantine` change it, and lifting a quarantine is the user's decision, never an agent's.
+
+```python
+def _project_root() -> Path | None:
+    """Nearest project root, walking up from $CLAUDE_PROJECT_DIR (else cwd):
+    the first directory holding capabilities/project.json or settings.json, legacy
+    .capabilities/, .contextkit/config.toml, .env(.local), or .git.
+    Markers are read from the filesystem alone: the root is what the envelope
+    location is resolved against, so resolving one cannot depend on the other.
+    $HOME is never a project root (the machine registry lives there)."""
+    start = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    here = Path(start).resolve()
+    home = Path.home().resolve()
+    for d in (here, *here.parents):
+        if d == home:
+            return None
+        if ((d / "capabilities" / "project.json").is_file()
+                or (d / "capabilities" / "settings.json").is_file()
+                or (d / ".contextkit" / "config.toml").is_file()
+                or (d / ".capabilities").is_dir() or (d / ".env").exists()
+                or (d / ".env.local").exists() or (d / ".git").is_dir()):
+            return d
+    return None
+
+def _project_capabilities_dir(root: Path) -> Path:
+    current = root / "capabilities"
+    legacy = root / ".capabilities"
+    if ((current / "project.json").is_file()
+            or (current / "settings.json").is_file() or not legacy.is_dir()):
+        return current
+    return legacy
+
+def _gate() -> None:
+    _auth_gate()
+    if sys.argv[1] in {"help", "stub", "manifest", "connections"}:
+        return
+    row = _records().resolve("capabilities", "policy").get(NAME)
+    effective = row.get("value") if row else None
+    if isinstance(effective, dict) and effective.get("enabled") is True:
+        return
+    _die(4, "not_enabled", f"{NAME} is not enabled by effective policy",
+         "ask whether to enable it --project or --global")
+```
+
+| Project entry | Global entry | Operational result |
+|---|---|---|
+| `true` | any | enabled by project |
+| `false` | any | disabled by project |
+| absent | `true` | enabled by inheritance |
+| absent | `false` or absent | disabled |
+
+The gate is a **guardrail, not a security boundary** — project resolution remains cwd-based. A malformed policy is a configuration error and operational absence is closed. The exit-4 envelope routes the scope decision to the human. Bundled service `init`, `start`, `run`, and `join` additionally require explicit project enable: inherited global availability grants CLI use, not ownership of a project daemon or consent to a machine one. A service that declares `service.machine` takes `--machine` on its service verbs, and such a call is the one operational use that resolves no project and reads no policy row: the machine service acts for a project only while that project explicitly enables the capability and is on the service's opt-in list, and checks both itself before every action it takes for that project ([machine mode](#machine-mode)). The read-only switch refuses its `init`, `start`, `run`, `reload`, and `leave` as it refuses a project's. This rule lives once in the preamble: `_gate()` applies it only when the executable declares a `SERVICE` manifest surface, so each service implements its lifecycle without repeating policy logic and domain commands merely named `service` remain ordinary CLI verbs.
+
+## Bundled services
+
+A capability that ships a service declares it in the manifest (`SERVICE`) and owns its lifecycle under `<name> service ...`. Which verbs it offers is the capability's business, with one exception fixed by doctrine: a service that takes a declaration ships `reload`.
+
+The daemon holds its declaration in memory and read the file once, so the file and the process part company the moment either moves. Three mechanics keep that honest.
+
+**The running process publishes what it loaded.** Beside its pid file and behind the same lock, the daemon writes a fingerprint of the declaration it adopted and removes it on exit. `doctor` compares that against the declaration on disk and fails while the two differ, so *the process is running* and *the process is current* stay separate answers.
+
+**Reload is signalled, never restarted.** `<name> service reload` loads and validates the declaration first: asking a healthy daemon to adopt a file that does not parse is refused before it is asked, naming the parse error. It then sends `SIGHUP` to the daemon alone and never to its process group, because the group is exactly where in-flight work lives. The daemon takes the request at a point in its loop where nothing is being decided, re-reads, validates again, and swaps only on success; a rejection leaves the previous declaration scheduling and is reported on the service log. The published fingerprint moves last, and only on success, so nothing can report itself current while running something else.
+
+**The caller waits for evidence.** `reload` returns when the published fingerprint reaches the one it computed and times out otherwise, so a success is demonstrated rather than assumed and a silent rejection cannot read as one. A daemon already holding the declaration is not signalled at all.
+
+This is also what lets a service be corrected from inside itself. A job cannot restart the program it runs under - stopping a program stops the process group the job is in, so it dies before the restart lands - but it can reload it, because a reload is the one operation that deliberately leaves the group alone.
+
+What a reload cannot change belongs in the verb's own help rather than in the caller's memory: an identity the process authenticated as, a state root, a records backend. Those need a restart, and saying which is part of shipping the verb.
+
+### Machine mode
+
+A service that declares `service.machine` runs in one of two modes from one implementation. In project mode it serves the project it was started in, as every bundled service does. In machine mode one process on the machine serves every project that opted in to it. Project mode is the case of a set of one: dispatch, its checks and the start of work are the same code in both.
+
+Opting in is explicit and apart from enable. `<name> service join`, run in a project that explicitly enables the capability, adds the project to the service's opt-in list, the file its `service.machine.projects` names; `<name> service leave` removes it. The service alone writes its list, keyed by project id, each entry naming the project's root, slug, and when and by whom it joined. The service notices a project joining, leaving, or whose folder is gone, and reports such a project rather than failing.
+
+Exactly one process serves a project at a time. A lock per project, the same lock in both modes, decides which. A joined project's project-mode `start` and `run` are refused, and a project another process still holds is reported as refused until it is free.
+
+The machine process decides when work starts and nothing about what the work is. It holds what is the machine's - its store connections, held rather than opened per question; an optional machine-wide cap on concurrent work; and the order in which projects are served under that cap - and it loads no project's environment or secrets, so a secret it needs for its own connections resolves from the machine's tiers. The work it starts is the project's: a child process whose working directory is the project, with the project's own environment, connections, grants, and declarations, as project mode starts it. Before every action it takes for a project it checks again that the project is on the list, explicitly enables the capability, and grants the connection the work needs.
+
+The blast radius is one project. Each project's declaration loads and reloads on its own, so a declaration that does not load stops that project only; a project can be paused alone; every log line and every status entry names the project it is about; and the machine status answers for each joined project as `served`, `paused`, `refused`, or `error`, with the reason.
+
+## The credential cascade
+
+Every executable resolves the values named by an explicit connection through the same deterministic cascade, first non-empty wins, so secrets can move from laptop files to deployment environment without changing the declared identity:
+
+1. **Flags** — explicit `--…` overrides, per invocation, for non-secret values only. **A secret never has a flag**: `argv` leaks (process lists, shell history), so a secret resolves from the tiers below, and a one-shot secret override is an env-prefix invocation — `ASANA_TOKEN=… asana …` — which is tier 4 working as designed.
+2. **Project env** — `.env.local` then `.env` at the project root (`_project_root()` above). The project you're working in wins.
+3. **User config** — `$XDG_CONFIG_HOME/<name>/credentials.env` (default `~/.config/<name>/`). The persistent per-machine default.
+4. **Process env** — exported or host-injected variables. The fallback that lets a deployed box, where no config file is present, resolve correctly.
+
+Process env sits **below** the user file deliberately: files are authoritative on a dev machine; injection governs on the box only because no file is there. A one-shot override is a flag (or an env-prefix), not an `export`. *System-injected* and *ambient export* are indistinguishable at runtime — both are just process env — so they share tier 4.
+
+This is the code shape that realizes the cascade, shared verbatim across executables so the resolution is identical everywhere:
+
+```python
+def _parse_env_file(path: Path) -> dict:
+    """Parse a KEY=VALUE env/dotenv file. Missing/unreadable file -> {}."""
+    out: dict = {}
+    try:
+        text = path.read_text()
+    except OSError:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        if k.startswith("export "):
+            k = k[len("export "):].strip()
+        out[k] = v.strip().strip('"').strip("'")
+    return out
+
+def _project_env() -> dict:
+    """Project .env(.local) at the project root. .env.local overrides .env."""
+    root = _project_root()
+    if root is None:
+        return {}
+    merged = _parse_env_file(root / ".env")
+    merged.update(_parse_env_file(root / ".env.local"))  # .local wins
+    return merged
+```
+
+The user-config path is rooted at `$XDG_CONFIG_HOME` (default `~/.config/`), never a bare `~/.config`:
+
+```python
+_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+CREDENTIALS_ENV = _CONFIG_HOME / "<name>" / "credentials.env"
+```
+
+Resolution is a single `pick` per value — first non-empty wins, in cascade order:
+
+```python
+def pick(flag, env_key):
+    # flag > project .env(.local) > user config > process env
+    return (getattr(args, flag, None)
+            or project.get(env_key)
+            or user.get(env_key)
+            or os.environ.get(env_key))
+```
+
+A missing required value fails through `_die` with the exact remediation for both ends of the cascade — what to set on a laptop, what to inject on a box — never a bare "not found".
+
+**Credential scope** is declared in the manifest (`SCOPE`). `project` — the default — homes the secret in the project's `.env`/`.env.local`, nothing global: the shape for service- and tenant-scoped tools. `user` homes it in `~/.config/<name>/credentials.env`: reserved for personal-account tools where one human has one identity. Scope names where install scaffolds and where `doctor` points its remediation; the cascade itself consults all four tiers, identically, regardless of scope.
+
+`credentials.env` is **human-written only**: a script never writes back into it. An artifact a login ceremony mints — a session cookie, an exchanged token — is state and lands in the state directory ([below](#state)). One writer per file, everywhere.
+
+A capability whose secret is not a flat token resolves it in its own shape — keyed indirectly through a config file, or persisted after a login exchange — but the **tiers and their order are preserved**: an explicit override beats project config beats user config beats process env, resolved by deterministic code. The shape may vary; the order may not.
+
+## Connections
+
+Every connection-bearing capability resolves its configuration as **explicit named connections**. A registry is required even when there is only one connection; environment variables resolve values for that declared connection but never create an identity implicitly. Core-only capabilities omit the connections tier and report an empty connections map.
+
+Endpoints and identities are declared as **connection records**, written at configuration time by whoever configures and read through the shared adapter. The two scopes are project then global. They compose by connection id: the highest scope declaring an id supplies that entire identity, while other ids inherit from the lower scope. A separate grant record carries `enabled` and `allow_write`, so project permission can change without restating identity. In files mode the compatible representation stores identities and grants together in `connections.json`; in database mode they remain separate collections.
+
+```json
+{
+  "default": "billing",
+  "connections": {
+    "billing": { "address": "billing@example.com", "imap_host": "mail.example.com",
+                 "secret_env": "MAILBOX_BILLING_APP_PASSWORD" },
+    "intake":  { "address": "intake@example.com",  "imap_host": "mail.example.com",
+                 "secret_env": "MAILBOX_INTAKE_APP_PASSWORD", "allow_write": false }
+  }
+}
+```
+
+The envelope is the standard's; the entry **interior** is the capability's (hosts and ports for an IMAP tool; url and workspace for a REST tool). Two field names are reserved in every entry:
+
+- **`secret_env`** — a secret never sits in the registry. The entry names the env key holding it, and that key's *value* resolves through cascade tiers 2–4 exactly as any secret does — the registry namespaces the key, the cascade resolves it. A capability with several secrets names each through its own `*_env` field.
+- **`allow_write`** — the connection's write gate ([below](#the-write-gate)), represented logically as a grant. Absent falls to the capability's declared `WRITE_DEFAULT`.
+
+Non-secret values sit literally in the entry: chosen, committed, per-connection project config — both the wiring (endpoints, workspaces) and any behavioural per-connection keys the capability defines.
+
+### Selection
+
+One flag selects, accepted by every domain verb: `--connection <id>`. A capability may accept a native alias beside it (`--mailbox <id|address>`); the standard flag always works. Resolution is deterministic, refusing ambiguity rather than guessing:
+
+```python
+def _connections_registry() -> dict:
+    """The effective identities and grants, independent of their backend."""
+    registry = _records().connections(NAME, write_default=WRITE_DEFAULT)
+    if not registry.get("connections"):
+        _die(6, "connections_required", f"{NAME} requires an explicit connection")
+    return registry
+
+def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict | None]:
+    """flag → default pointer → sole entry → die 6."""
+    if reg is None:
+        _die(6, "connections_required", f"{NAME} requires an explicit registry")
+    conns = reg["connections"]
+    if wanted:
+        if wanted in conns:
+            return wanted, conns[wanted]
+        _die(6, "unknown_connection", f"no connection matches {wanted!r}",
+             f"known: {', '.join(conns)}")
+    default = reg.get("default")
+    if default:
+        if default not in conns:
+            _die(6, "bad_default", f"default points to unknown connection {default!r}",
+                 f"known: {', '.join(conns)}")
+        return default, conns[default]
+    if len(conns) == 1:
+        cid = next(iter(conns))
+        return cid, conns[cid]
+    _die(6, "ambiguous_connection",
+         f"registry defines {len(conns)} connections and no default; pass --connection <id>",
+         f"known: {', '.join(conns)}")
+```
+
+`default` is a **pointer, not an entry**: connection ids are stable identities — state keys, log lines, `--connection` arguments — and which one is default is policy that moves without renaming anything. The pointer makes two defaults structurally impossible.
+
+### The write gate
+
+A connection without `"allow_write": true` resolves its writability from two declarations: the entry's own `allow_write`, else the capability's **`WRITE_DEFAULT`**. A connection that resolves to `false` is a **source**: read verbs run, write verbs exit 4. The script declares which of its domain verbs mutate the remote system in one constant — `WRITE_VERBS` — and refuses at dispatch, after selection, before any credential resolves:
+
+```python
+def _write_gate(conn_id: str, conn: dict | None, verb: str) -> None:
+    """Policy from the committed registry; nothing in the cascade lifts it."""
+    if verb in WRITE_VERBS and not (conn or {}).get("allow_write", WRITE_DEFAULT):
+        _die(4, "read_only",
+             f"connection {conn_id!r} does not allow writes",
+             "Do not lift the gate yourself — ask the user; granting is "
+             "`allow_write: true` on this connection in connections.json.")
+```
+
+`WRITE_DEFAULT` is the capability's word on what silence means, declared once in the script: `True` for tools whose writes stay inside a system the consumer owns; **`False` when a write leaves the system**. Under `WRITE_DEFAULT = False`, writing is granted per connection, deliberately, in a registry entry. The refused write is the ceremony: exit 4 at the moment of intent routes the grant decision to the human with the exact remediation in hand.
+
+The principle: **the cascade resolves values; a gate is not a value.** No flag, no env var, no tier overrides the gate — it reads from the two declarations alone, and the exit-4 envelope routes the decision to the human, exactly as the project gate does. Exit 4 is the policy-refusal code in both.
+
+**The read-only switch closes every gate at once and opens none.** `CAPABILITIES_READ_ONLY` set to `1` or `true` (any case) in a capability's environment puts it, and every process it starts, under the switch; unset, `0` or `false` leave everything as declared. Under it every connection resolves read-only whatever its grant or `WRITE_DEFAULT`, and every write verb exits 4 with the code `read_only_switch`, distinct from a connection's own `read_only`. The same refusal covers a write to a project record — identifiers, references, connections, grants, settings, policy — whether a capability or the manager would make it, and a bundled service's `init`, `start`, `run` and `reload`. A capability's operational state and caches keep writing, so a read that refreshes a local store still succeeds. The contract decides the switch once, in the store tier (`read_only_switch()`), because that tier is the one every capability carries and the manager and bundled services import; every writer consults it and none reimplements it. `<name> connections` and `capabilities doctor` report it while it is on.
+
+### Machine reads
+
+Outside any project there is no scope a grant could be written in, so a capability may declare, beside `WRITE_DEFAULT`, the read verbs that there use the machine's own connections: `MACHINE_READS = ("connections", "doctor")`, a tuple of verbs the capability exposes, none of them a write verb, which the manager validates wherever it validates a capability. Absent or empty, the capability has no machine reads. Outside any project a declared verb sees every connection declared globally whose grant does not resolve to `enabled: false`, each one a source whatever its grant or `WRITE_DEFAULT` says, so a write through it exits 4 `read_only`, and `connections` names each one as the machine's under `machine_reads`. Every other verb outside a project is refused the machine's connections, and inside a project grants alone decide what every verb may use. The policy gate and the machine ceiling come first, as for any verb, and the read-only switch still closes every gate.
+
+### `connections` — the resolution report
+
+`<name> connections` prints where every value of every declared connection resolves from — the programmatic answer to *"which credentials is this using, and from where?"*. It is **purely local**: resolution only, no network, no authentication attempt (readiness stays `doctor`'s question). The report always carries the same shape, so a consumer never branches on cardinality:
+
+```json
+{
+  "default": "billing",
+  "connections": {
+    "billing": {
+      "allow_write": true,
+      "keys": [
+        { "key": "address", "secret": false, "required": true, "set": true,
+          "tier": "connection", "source": "/path/capabilities/mailbox/connections.json",
+          "value": "billing@example.com" },
+        { "key": "MAILBOX_BILLING_APP_PASSWORD", "secret": true, "required": true, "set": true,
+          "tier": "project", "source": "/path/.env.local", "value": "…k9f3" }
+      ]
+    }
+  }
+}
+```
+
+Per key: `set` — a non-empty value resolved; `tier` — `connection` (literal in the registry entry), `project` (`.env`/`.env.local`), `user` (`credentials.env`), or `env` (process env); `source` — the winning file's absolute path, `null` for process env. A flag override is per-invocation and never part of the report. An unset required key reports `"set": false` with the same remediation `doctor` would name. `allow_write` is the **effective** value — the entry's, else `WRITE_DEFAULT` applied.
+
+A non-secret value prints in full. A secret prints **masked** — `…` plus the last 4 characters, fully masked (`"****"`) when shorter than 8 — one fixed rule, never a per-capability choice:
+
+```python
+def _mask(value: str) -> str:
+    return ("…" + value[-4:]) if len(value) >= 8 else "****"
+```
+
+Beside the connections the report carries `policy`, the capability's effective policy state in the words `capabilities list` uses: `effective` (`enabled` or `disabled`), the `source` that decided it (`machine` for the ceiling, `project`, `global`, or `default` when neither scope says anything) and the `machine` ceiling itself. A policy record that cannot be read is reported there as the refusal the gate would give, and the report still answers.
+
+A **core-only** capability — one carrying the `capability core` fence and no `connections` fence, because it has nothing to resolve (it drives a local tool or the host, with no credentials or endpoint) — still answers `connections`, reporting an empty map: `{ "connections": {}, "default": null }`. That absence is the contract, not a gap: `audit` accepts the empty report in place of the explicit-registry checks, and never writes a registry against such a capability.
+
+## Identity-free
+
+A shared tool bakes in no consumer's identity — no person, company, tenant, account, or host-with-tenant **value** (DOCTRINE rule 10). The consumer supplies those through the cascade; the tool refers to them by role. Config-key *names* (`<NAME>_API_KEY`, `<NAME>_WORKSPACE`) are structural and belong in the script; the *values* never do. This holds in the help text too: examples use placeholders (`user@example.com`, `<PERSON>`), never a real name or address. A default that would otherwise hardcode a consumer (an author or actor name, a default identity) is sourced from env/config with no baked-in fallback — absent the value, the tool asks for it rather than assuming one.
+
+## State
+
+State follows the **scope of the credentials that minted it**, resolved by one shared shape:
+
+```python
+_STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+
+def _state_dir() -> Path:
+    if SCOPE == "project":
+        root = _project_root()
+        if root is not None:
+            envelope = _project_capabilities_dir(root)
+            if ((envelope / "project.json").is_file()
+                    or (envelope / "settings.json").is_file()):
+                return envelope / NAME / "state"
+    return _STATE_HOME / NAME
+```
+
+- **Project scope** → `<root>/capabilities/<name>/state/` — session cookies, scrape caches, pin-pending markers, session maps, each project isolated to its own account session. The manager-owned `capabilities/.gitignore` guarantees `*/state/` never commits. Outside an initialized envelope state falls back to the user state home; operational use there still requires global policy enable and an explicit global connections registry where the capability bears connections.
+- **User scope** → `$XDG_STATE_HOME/<name>/` (default `~/.local/state/<name>/`).
+
+A stateful capability keys its state **per connection** — `<state-dir>/<connection-id>/…` — so two connections of one capability never share a session. The guides cache is the exception: guide content is capability-scoped and connection-independent, so it stays unkeyed at the user state home.
+
+**Bulk data stores are relocatable at the root, fixed inside.** A capability that syncs bulk data (message archives, exports) defaults the store to `<state-dir>/<connection-id>/…` like any state — and MAY expose the **root** as a per-connection key on the connection entry (e.g. `messages_dir`: absolute, or relative to the project root) for a consumer who wants the data elsewhere. Only the root moves: the structure beneath it is the CLI's contract, documented in its help, identical wherever the root points. The `*/state/` gitignore guard covers only the default location, so the guard travels as a responsibility: `doctor` verifies the active root is git-ignored and warns when it is not (DOCTRINE rule 16 — synced data is minted by credentials and never commits).
+
+Known limitation, recorded for fast diagnosis: two projects driving the *same* account of a single-session service thrash each other's cookies (login here invalidates the cookie there). Per-project state trades that for account isolation — the right trade where re-logins are cheap.
+
+## The I/O contract
+
+Success is JSON on **stdout**; failure is a structured envelope on **stderr**; the exit code carries the category. Two helpers are the whole contract:
+
+```python
+def _emit(value) -> None:
+    if isinstance(value, str):
+        sys.stdout.write(value if value.endswith("\n") else value + "\n")
+    else:
+        sys.stdout.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+def _die(exit_code: int, code: str, message: str,
+         hint: str | None = None, status: int | None = None) -> NoReturn:
+    err: dict = {"code": code, "message": message}
+    if hint:
+        err["hint"] = hint
+    if status is not None:
+        err["status"] = status
+    sys.stderr.write(json.dumps({"error": err}, ensure_ascii=False) + "\n")
+    sys.exit(exit_code)
+```
+
+`_emit` prints structured results as indented JSON and scalar results (a hash, a job id) as a bare string — a caller can consume either without a schema dance. `_die` prints exactly one shape — `{"error": {"code", "message", "hint"?, "status"?}}` — where `code` is a stable machine token, `message` is human-readable, `hint` is the remediation when one exists, and `status` is the upstream HTTP status when the failure came from a request. stdout stays clean for data; diagnostics never pollute it. The gate's exit-4 refusal rides this same envelope — one error shape, everywhere.
+
+## Exit-code taxonomy
+
+The code tells the caller *which kind* of failure without parsing the message:
+
+| Code | Meaning |
+|---|---|
+| `0` | success |
+| `2` | auth — missing/rejected credentials, 401/403 |
+| `3` | not found — the addressed resource does not exist, 404 |
+| `4` | policy refusal — effective project/global capability policy, explicit project requirement for service activation, or a write verb on a read-only connection |
+| `5` | server / network — timeout, connection error, 429 after retries, 5xx |
+| `6` | input / validation — a malformed argument, a bad date, a conflicting flag |
+
+Code `1` is left to the runtime for an uncaught exception — a bug, not a handled outcome; handled failures always carry one of the categories above. A capability may add codes **from 7 up** for a domain-specific outcome it needs a caller to branch on (a task blocked by open dependencies, say); it states each addition in its help's exit-code table. The numbers are stable — a caller scripts against them.
+
+## Resilient HTTP
+
+An HTTP CLI wraps every request in one retry loop with bounded, backed-off retries, so a transient rate-limit or 5xx is absorbed rather than surfaced:
+
+```python
+TIMEOUT = httpx.Timeout(60.0)
+MAX_RETRIES = 3
+
+for attempt in range(1, MAX_RETRIES + 1):
+    try:
+        resp = client.request(method, path, params=params, json=json_body)
+    except httpx.TimeoutException:
+        if attempt < MAX_RETRIES:
+            time.sleep(attempt * 1.5); continue
+        _die(5, "timeout", f"request timed out: {method} {path}", "<service> was unresponsive")
+    except httpx.RequestError as e:
+        _die(5, "network_error", f"network error: {e}", "check connectivity")
+
+    if resp.status_code == 429:
+        retry_after = float(resp.headers.get("Retry-After", str(attempt * 1.5)))
+        if attempt < MAX_RETRIES:
+            time.sleep(retry_after); continue
+        _die(5, "rate_limited", "rate-limited", status=429)
+    if resp.status_code >= 500:
+        if attempt < MAX_RETRIES:
+            time.sleep(attempt * 1.5); continue
+        _die(5, "server_error", f"<service> returned {resp.status_code}", status=resp.status_code)
+    # 4xx → map to 2/3/6 by status; 2xx → return parsed body
+```
+
+A 429 honours the server's `Retry-After` header (falling back to the linear schedule); a timeout or 5xx backs off `attempt * 1.5` seconds; after `MAX_RETRIES` the loop converts the failure into a `_die(5, …)` carrying the upstream `status`. A 4xx is not retried — it maps straight to `2` (auth), `3` (not found), or `6` (validation). A CLI over a non-HTTP protocol realizes the same intent in its protocol's terms — fail fast and clearly on a connection error, retry only what is idempotent and transient.
+
+## `doctor`
+
+Every CLI has a `doctor` subcommand: the cheapest authenticated round-trip that proves the whole chain — credentials resolved, endpoint reachable, identity confirmed. It examines **every connection**: bare, it round-trips each configured connection and reports per id — `{"ok": <all healthy>, "connections": {"<id>": {…}}}` — exiting `0` only when every connection is healthy, else with the first failure's category; `doctor --connection <id>` checks one. Per connection it carries a few cheap facts (the service version, the authenticated identity, a reachability flag) and rides the same exit-code taxonomy — `0` healthy, `2` if credentials are missing or rejected, `5` if the service is unreachable. It is the first thing an agent runs against a tool, and for a stateful CLI it is also the recovery point: `doctor` detects an expired session and attempts re-authentication before reporting, so a healthy exit means *ready to work*, not merely *configured*.
+
+Credential resolution is the **first gate, and it is network-free**: before any round-trip, `doctor` resolves the connection(s) under test through the cascade — the *same* resolution [`connections`](#connections--the-resolution-report) reports — and refuses with exit `2` when any **required** key is unset, naming the remediation from the credential scope and `CRED_KEYS`. The verdict is the cascade's, read across its resolution tiers (`connection` literal, `project`, `user`, `env`) from the connection's own report rows — **never the presence of any single file**. One resolver, two consumers: `doctor`'s readiness gate and `connections`' report answer *"are the credentials here?"* through the same per-key resolution, so they cannot diverge — the failure mode where a `doctor` preflight checks one tier while the real commands resolve through all of them is structurally precluded.
+
+```python
+def _missing_required(keys: list[dict]) -> list[str]:
+    """Required report rows (from `_key_report`) that did not resolve through the
+    cascade — empty ⇒ credentials present. `doctor`'s network-free gate, derived
+    from the same per-key resolution `connections` prints, so the readiness gate
+    and the resolution report can never disagree."""
+    return [k["key"] for k in keys if k["required"] and not k["set"]]
+```
+
+Only a connection that clears this gate proceeds to the live round-trip (the per-capability authenticated probe, conventionally `_check_connection`). A capability with nothing to resolve — core-only, empty `CRED_KEYS`, carrying no `connections` fence — has no gate to clear: `doctor` proves whatever local readiness it can (a host grant, a tool on `PATH`) and stops there.
+
+`doctor` is the **readiness oracle**. The stub only announces that a tool exists, so "is it wired up *here*?" is `doctor`'s question to answer at use-time, never inferred from stub presence. A failing `doctor` names the exact remediation. A connection-bearing capability is ready only after effective policy enables it and an explicit project or global registry declares its identity; the registry's named values then resolve through the credential cascade. A core-only capability still has no registry requirement.
+
+## Conformance and deviation
+
+These patterns are a strong default, not a cage — the same standing allowance the doctrine grants ([DOCTRINE.md](DOCTRINE.md#deviations-are-allowed--and-recorded)). A capability whose protocol or interaction model genuinely differs realizes the *intent* of a pattern in its own form. Such a deviation is **recorded in the capability's own dedicated deviation file** — a file whose sole purpose is to describe it, kept apart so it is never commingled with other content or accidentally dropped — never here: this standard states the rule, a capability states its own exception, in its own folder. `capabilities audit` reads that file first and treats the deviation as a deliberate choice, not drift to fix. The bar is realizing the intent: a deterministic cascade, deterministic connection selection with a hard write gate, a clean stdout/stderr split, a stable exit-code contract, the contract verbs, the gate, a `doctor`, an agent-first help, and no consumer identity baked in.

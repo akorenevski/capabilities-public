@@ -1,0 +1,7 @@
+{
+  "connections": {
+    "store": {
+      "enabled": true
+    }
+  }
+}

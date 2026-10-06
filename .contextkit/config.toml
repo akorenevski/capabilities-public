@@ -1,0 +1,16 @@
+version = 1
+type = "agent-project"
+
+[body]
+root = "agent"
+
+[sources]
+# Optional shared doctrine outside this project:
+global_context = "~/dev/workspace/context"
+
+[output]
+# Generated context file every host reads through its own link.
+context = ".contextkit/generated/context.md"
+
+[identity]
+id = "prj_1c9946879efd"
