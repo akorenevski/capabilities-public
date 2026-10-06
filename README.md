@@ -9,6 +9,8 @@ This repository runs on two open tools by Konstantin Žilin and [Cluster One](ht
 - [capabilities](https://github.com/ai-cluster-one/capabilities): the manager that installs, gates and updates capabilities, and the official catalogue. This repository is one more source it installs from, and every capability here follows its contract.
 - [ContextKit](https://github.com/ai-cluster-one/context-kit): the project context for agents. This repository is also a ContextKit project, with its body under `agent/`.
 
+## Capabilities
+
 | Capability | What it does |
 |---|---|
 | [`my-notion`](capabilities/my-notion) | Notion over the REST API: pages and databases. Publish markdown, create and upsert pages; create databases, add, query and update rows on the 2026-03-11 data-source model; views, users, comments, attachments and archive. Several workspaces through named connections. |
