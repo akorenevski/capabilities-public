@@ -1,13 +1,10 @@
 **/__pycache__/
 *.pyc
 
-# ContextKit local and generated files
+# Local environment files
 .env
 .env.local
 .env.*.local
-.contextkit/generated/
-.contextkit.md
-.claude/rules/CONTEXT.md
 __pycache__/
 .DS_Store
 *.pyo
@@ -32,9 +29,6 @@ id_ed25519*
 # Capability runtime state
 */state/
 capabilities/*/state/
-
-# This machine's Telegram account grant: an account id, not for a public repo
-agent/capabilities/telegram/
 
 *.log
 .idea/

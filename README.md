@@ -7,7 +7,7 @@ Capabilities by Alexander Korenevski: self-contained command-line tools for AI a
 This repository runs on two open tools by Konstantin Žilin and [Cluster One](https://aicluster.one):
 
 - [capabilities](https://github.com/ai-cluster-one/capabilities): the manager that installs, gates and updates capabilities, and the official catalogue. This repository is one more source it installs from, and every capability here follows its contract.
-- [ContextKit](https://github.com/ai-cluster-one/context-kit): the project context for agents. This repository is also a ContextKit project, with its body under `agent/`.
+- [ContextKit](https://github.com/ai-cluster-one/context-kit): the project context for agents. In a project that uses these capabilities, the manager keeps their settings where ContextKit says, and their summaries reach the agent through its context.
 
 ## Capabilities
 
