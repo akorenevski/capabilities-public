@@ -1,5 +1,19 @@
 # my-notion — change log
 
+## 2026-10-08 — Edit a page in place, search, restore, edit a comment, attach anywhere
+
+`publish` rebuilds every block, and a comment left on a line is lost with its block. Three verbs now change a page and keep every other block, its id and its threads: `edit <page> --old <text> --new <md>` replaces text through the markdown endpoint's `update_content` (each match must be unique unless `--all`, otherwise Notion refuses and nothing changes); `insert <page> --after <text>` adds markdown after one line; `block-update <block> <text>` rewrites one block's text by its id. Verified against the live API: the edited lines keep their ids and their comments.
+
+`search <text>` finds pages and databases by title among those shared with the integration; a database hit carries the database id that every `<db>` argument takes. The old note that search is closed to such tokens is replaced: it answers with an internal integration token.
+
+`restore <ref>` takes a page, a database (`--database`) or a deleted block (`--block`) out of the trash. A page returns under its old parent; a block returns at the end of its page.
+
+`comment-edit <comment> <text>` replaces the text of a comment this token wrote, in its thread, under the same id.
+
+`attach` takes a public http(s) URL as well as a local file (Notion fetches it itself), sends a file over 20 MB in parts, and with `--cover`, `--icon` or `--property <column>` puts the file on the page cover, the page icon or a Files column of a database row, keeping the files already there. A free workspace takes files up to 5 MB and refuses multi-part uploads; the refusal says so. The multi-part path is not yet exercised on a paid workspace.
+
+`page-meta` and `link`, which already worked, are now in `my-notion help`.
+
 ## 2026-10-08 — `comment-delete` removes a comment
 
 `my-notion comment-delete <comment>` deletes one comment through `DELETE /v1/comments/{id}`; the id comes from `comments`. Notion lets a token delete only the comments it wrote and answers 404 for anyone else's, the same as for an id that does not exist, so the error hint names both causes. The other comments in the thread stay. It is a write verb: a read-only connection refuses it with exit 4.

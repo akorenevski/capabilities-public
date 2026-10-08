@@ -62,6 +62,46 @@ Commands — pages:
   my-notion upsert --parent <p> [--title T] [<md>|-]
                                               Update by exact title or create.
   my-notion archive <ref> [--database]         Move a page (or database) to trash.
+  my-notion restore <ref> [--database|--block] Take it back out of the trash
+                                              (also a block deleted with
+                                              `archive --block`): same id,
+                                              children and comments. A page
+                                              returns to its old parent; a
+                                              BLOCK returns at the END of its
+                                              page, not where it stood.
+                                              Notion keeps the trash 30 days.
+  my-notion search <text> [--type page|database] [--limit N]
+                                              Find pages and databases by TITLE
+                                              among those shared with the
+                                              integration, newest edit first.
+  my-notion page-meta <page> [--parent P] [--title T]
+                                              Move a page (with its subpages)
+                                              under another page, and/or rename
+                                              it. Read back after the move; a
+                                              page Notion did not move is
+                                              reported, not called "moved".
+  my-notion link <page> <target>               Put a link to <target> on <page>;
+                                              it shows like a subpage while the
+                                              target stays where it lives.
+
+Commands — editing a page in place (blocks, ids and line comments survive):
+  `publish` rebuilds every block, and a comment left on a line is lost with
+  its block. To change part of a page that people have commented on, use:
+  my-notion edit <page> --old <text> --new <md> [--old .. --new ..] [--all]
+                                              Replace text. Each --old must
+                                              match exactly once (--all: every
+                                              match); otherwise Notion refuses
+                                              and NOTHING changes. --new takes
+                                              markdown (**bold**, links).
+  my-notion insert <page> --after <text> [<md>|-]
+                                              Insert markdown right after the
+                                              line containing <text> (or a span
+                                              'start...end'); it must match once.
+  my-notion block-update <block> [<text>|-]    Rewrite one block's text by its
+                                              id (from `blocks`), keeping its
+                                              type and children. Inline
+                                              markdown: **bold**, *italic*,
+                                              ~~strike~~, `code`, [text](url).
 
 Commands — databases (data-source model, Notion-Version 2026-03-11):
   my-notion db-create --parent <p> [--title T] [<props>|-]
@@ -213,6 +253,10 @@ Commands — comments, files:
                                               exactly like a wrong id, so a 404
                                               here can mean either. The other
                                               comments in its thread stay.
+  my-notion comment-edit <comment> <text>      Replace the text of one comment;
+                                              it keeps its id and thread. Only
+                                              the token's OWN comments, as with
+                                              delete (anyone else's answers 404).
   my-notion blocks <page|block>                List the direct child blocks: id,
                                               type, text, has_children. Pass a
                                               block id to walk into nested
@@ -220,10 +264,20 @@ Commands — comments, files:
                                               reads the threads on one block,
                                               which `comments <page>` does not
                                               return.
-  my-notion attach <page> <file> [--caption T] Put a local file into the page
-                                              body. Images/video/pdf get their own
+  my-notion attach <page> <file|url> [--caption T] [--cover|--icon|--property COL]
+                                              Put a file into the page body.
+                                              Images/video/pdf get their own
                                               block type, so a screenshot is
                                               visible rather than a download link.
+                                              A file over 20 MB goes up in parts
+                                              by itself (paid plans only: a free
+                                              workspace caps files at 5 MB). An http(s) URL is
+                                              fetched by Notion, nothing is
+                                              downloaded here. --cover / --icon
+                                              set the page cover or icon instead;
+                                              --property adds the file to that
+                                              Files column of a database row,
+                                              keeping the files already there.
   my-notion files <page>                       List attachments with FRESH urls.
                                               Notion signs them and they expire in
                                               about an hour — never store one.
@@ -287,9 +341,10 @@ Exit codes:
   7  conflict (domain-specific: ambiguous title in upsert, concurrent edit)
 
 Quirks worth knowing:
-  - `POST /v1/search` is unavailable to PAT tokens (returns 0 results).
-    To locate a page by name, list a known parent's `children` and match
-    in the caller. There is no global workspace-wide name lookup.
+  - `search` matches titles only, and only pages shared with the
+    integration. Verified 2026-10-08 with an internal integration token; a
+    personal access token was once seen to get zero results here, so an
+    empty answer with such a token may be a refusal, not "no such page".
   - `GET /v1/users` is likewise refused to PAT tokens (403 restricted_resource,
     "Personal access tokens cannot list users"). `users list` says so rather
     than returning an empty directory; see the `users` block above.
@@ -326,7 +381,8 @@ CRED_KEYS = [
 ]
 WRITE_VERBS = {"publish", "append", "create", "upsert",
                "db-create", "db-add", "db-update", "archive",
-               "comment", "comment-delete", "attach", "db-alter", "db-meta", "page-meta", "link",
+               "comment", "comment-delete", "comment-edit", "attach",
+               "edit", "insert", "block-update", "restore", "db-alter", "db-meta", "page-meta", "link",
                "view-create", "view-update", "view-delete"}   # domain verbs that mutate Notion
 WRITE_DEFAULT = True    # writes stay inside a workspace the consumer owns
 DOCS_BASE = ""      # upstream guides base URL; "" while no guides ship
@@ -4132,7 +4188,8 @@ def _client(token: str) -> httpx.Client:
 
 def _request(client: httpx.Client, method: str, path: str,
              json_body: dict | None = None,
-             not_found_hint: str | None = None) -> dict:
+             not_found_hint: str | None = None,
+             validation_hint: str | None = None) -> dict:
     last_status: int | None = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -4183,7 +4240,8 @@ def _request(client: httpx.Client, method: str, path: str,
                     "verify the page UUID and that the PAT can see it"
             elif notion_code == "validation_error":
                 exit_code = 6
-                hint = "check request body shape against Notion API docs"
+                hint = validation_hint or \
+                    "check request body shape against Notion API docs"
             elif notion_code == "conflict_error":
                 exit_code = 7
                 hint = "the resource was modified concurrently; retry"
@@ -4405,6 +4463,144 @@ def cmd_publish(c: httpx.Client, page: str, md: str) -> dict:
         data = _request(c, "PATCH", f"/pages/{page_id}",
                         _title_property_body(prop_key, h1_title))
     return _page_summary(data, action="updated")
+
+
+# --- edits in place -----------------------------------------------------------
+#
+# `publish` rebuilds every block, and a comment left on a line goes with the
+# block it sits on. On 2026-10-08 that nearly cost eleven line comments on a
+# shared terms page. The three verbs below change a page and keep every other
+# block, its id and its threads. Verified live 2026-10-08: `update_content`
+# rewrites a line in place (same block id, comments still on it), and
+# `insert_content` with `after` adds blocks without touching their neighbours.
+
+def cmd_edit(c: httpx.Client, page: str, pairs: list[tuple[str, str]],
+             replace_all: bool) -> dict:
+    """Replace text on a page, keeping the blocks it sits in and their comments.
+
+    Each old text must match exactly once unless `replace_all`; Notion refuses
+    an ambiguous or missing match and changes nothing, and its message (which
+    quotes the page) is passed through so the caller sees why.
+    """
+    page_id = _to_uuid(page)
+    updates = [{"old_str": o, "new_str": n,
+                **({"replace_all_matches": True} if replace_all else {})}
+               for o, n in pairs]
+    data = _request(c, "PATCH", f"/pages/{page_id}/markdown",
+                    {"type": "update_content",
+                     "update_content": {"content_updates": updates}})
+    return {"object": "page", "page_id": page_id, "replaced": len(updates),
+            "markdown": data.get("markdown"), "action": "edited"}
+
+
+def cmd_insert(c: httpx.Client, page: str, after: str, md: str) -> dict:
+    """Insert markdown after the line holding `after`, nothing else moves.
+
+    `after` is the text of that line, or `start...end` for a span; it must
+    match once. The new blocks get new ids; every existing block keeps its own.
+    """
+    page_id = _to_uuid(page)
+    data = _request(c, "PATCH", f"/pages/{page_id}/markdown",
+                    {"type": "insert_content",
+                     "insert_content": {"content": md, "after": after}})
+    return {"object": "page", "page_id": page_id,
+            "markdown": data.get("markdown"), "action": "inserted"}
+
+
+_INLINE = re.compile(r"(\*\*.+?\*\*|~~.+?~~|`[^`]+`|\[[^\]]+\]\([^)\s]+\)"
+                     r"|(?<![*\w])\*[^*\s][^*]*?\*(?!\*)|(?<!\w)_[^_\s][^_]*?_(?!\w))")
+
+
+def _rich_text(md: str) -> list:
+    """Inline markdown (bold, italic, strike, code, links) as Notion rich text."""
+    out: list = []
+
+    def seg(text: str, url: str | None = None, **ann) -> None:
+        for i in range(0, len(text), 1900):
+            t: dict = {"type": "text", "text": {"content": text[i:i + 1900]}}
+            if url:
+                t["text"]["link"] = {"url": url}
+            if ann:
+                t["annotations"] = ann
+            out.append(t)
+
+    for part in _INLINE.split(md):
+        if not part:
+            continue
+        if part.startswith("**") and part.endswith("**") and len(part) > 4:
+            seg(part[2:-2], bold=True)
+        elif part.startswith("~~") and part.endswith("~~") and len(part) > 4:
+            seg(part[2:-2], strikethrough=True)
+        elif part.startswith("`") and part.endswith("`") and len(part) > 2:
+            seg(part[1:-1], code=True)
+        elif m := re.fullmatch(r"\[([^\]]+)\]\(([^)\s]+)\)", part):
+            seg(m.group(1), url=m.group(2))
+        elif len(part) > 2 and part[0] == part[-1] and part[0] in "*_":
+            seg(part[1:-1], italic=True)
+        else:
+            seg(part)
+    return out
+
+
+def cmd_block_update(c: httpx.Client, block: str, text: str) -> dict:
+    """Rewrite one block's text by its id; the block, its children and its
+    comments stay. Its type stays too: a bullet remains a bullet."""
+    block_id = _to_uuid(block)
+    b = _request(c, "GET", f"/blocks/{block_id}")
+    btype = b.get("type")
+    if "rich_text" not in (b.get(btype) or {}):
+        _die(6, "no_text", f"a {btype} block has no text to rewrite",
+             "take a text block's id from `blocks` (paragraph, heading, "
+             "bullet, to-do, quote, callout, toggle)")
+    _request(c, "PATCH", f"/blocks/{block_id}",
+             {btype: {"rich_text": _rich_text(text.rstrip("\n"))}})
+    return {"object": "block", "id": block_id, "type": btype,
+            "action": "updated"}
+
+
+def cmd_search(c: httpx.Client, query: str, kind: str | None,
+               limit: int) -> dict:
+    """Pages and databases whose title matches, among those the token can see.
+
+    Verified 2026-10-08 with an internal integration token: `POST /v1/search`
+    answers. Notion matches titles, not body text, and sees only what has been
+    shared with the integration.
+    """
+    body: dict = {"query": query, "page_size": min(limit or 100, 100),
+                  "sort": {"direction": "descending",
+                           "timestamp": "last_edited_time"}}
+    if kind:
+        body["filter"] = {"property": "object",
+                          "value": "data_source" if kind == "database" else kind}
+    out, cursor = [], None
+    while True:
+        if cursor:
+            body["start_cursor"] = cursor
+        data = _request(c, "POST", "/search", body)
+        for r in data.get("results", []):
+            if r.get("object") == "page":
+                title = _page_title(r)
+            else:
+                title = "".join(t.get("plain_text", "")
+                                for t in r.get("title", []) or [])
+            parent = r.get("parent") or {}
+            hit = {"object": r.get("object"), "id": r.get("id"),
+                   "title": title, "url": r.get("url"),
+                   "parent": {k: v for k, v in parent.items() if k != "type"},
+                   "last_edited_time": r.get("last_edited_time")}
+            if r.get("object") == "data_source":
+                # Every <db> argument here takes the DATABASE id; Notion's
+                # search answers with the data source, whose parent it is.
+                hit = {**hit, "object": "database",
+                       "id": parent.get("database_id"),
+                       "data_source_id": r.get("id"), "parent": None}
+            out.append(hit)
+        if (limit and len(out) >= limit) or not data.get("has_more"):
+            break
+        cursor = data.get("next_cursor")
+    if limit:
+        out = out[:limit]
+    return {"query": query, "count": len(out), "results": out}
 
 
 def _resolve_title(h1_title: str | None, title_arg: str | None) -> str:
@@ -5378,6 +5574,27 @@ def cmd_archive(c: httpx.Client, ref: str, is_database: bool,
             "id": obj_id, "action": "archived"}
 
 
+def cmd_restore(c: httpx.Client, ref: str, is_database: bool,
+                is_block: bool = False) -> dict:
+    """Take a page, database or deleted block back out of the trash.
+
+    The undo of `archive`: the same object comes back with its id, children
+    and comments. Measured 2026-10-08: a page returns under its old parent,
+    but a restored block lands at the end of its parent, not where it stood."""
+    obj_id = _to_uuid(ref)
+    endpoint = "blocks" if is_block else \
+        "databases" if is_database else "pages"
+    data = _request(c, "PATCH", f"/{endpoint}/{obj_id}", {"in_trash": False},
+                    not_found_hint="no such id, or the trash was emptied: "
+                                   "Notion keeps trashed pages for 30 days")
+    if data.get("in_trash") or data.get("archived"):
+        _die(5, "restore_did_not_take",
+             f"Notion accepted the request and {obj_id} is still in the trash",
+             "restore it in the app", status=200)
+    return {"object": endpoint[:-1], "id": obj_id, "url": data.get("url"),
+            "action": "restored"}
+
+
 # --- comments and files -------------------------------------------------------
 #
 # Neither exists upstream, and without them a card is only text. A board that
@@ -5505,50 +5722,151 @@ def cmd_comment_delete(c: httpx.Client, comment: str) -> dict:
     return {"object": "comment", "id": cid, "action": "deleted"}
 
 
-def cmd_attach(c: httpx.Client, page: str, path: str,
-               caption: str | None) -> dict:
-    """Put a local file into the page body.
+def cmd_comment_edit(c: httpx.Client, comment: str, text: str) -> dict:
+    """Replace the text of one comment; it stays in its thread, same id.
 
-    Notion takes three steps: declare the upload, send the bytes to the issued
-    address, then attach the finished id as a block. The block type follows the
-    extension: an image shows on the card, everything else becomes a file. A
-    picture that arrives as a `file` block is not visible to the eye, and the
-    whole point of an attachment is that someone looks at it.
-    """
-    import mimetypes, pathlib as _pl
-    f = _pl.Path(path).expanduser()
-    if not f.is_file():
-        _die(6, "no_file", f"file not found: {f}")
-    ctype = mimetypes.guess_type(f.name)[0] or "application/octet-stream"
-    up = _request(c, "POST", "/file_uploads",
-                  {"mode": "single_part", "filename": f.name,
-                   "content_type": ctype})
-    upload_url, up_id = up.get("upload_url"), up.get("id")
-    if not upload_url or not up_id:
-        _die(5, "upload_refused", "Notion did not return an upload URL")
+    As with deleting, Notion lets a token edit only the comments it wrote."""
+    cid = _to_uuid(comment)
+    data = _request(c, "PATCH", f"/comments/{cid}",
+                    {"rich_text": _rich_text(text[:6000])},
+                    not_found_hint="no such comment, or it was written by "
+                                   "another token: Notion lets a token edit "
+                                   "only its own comments")
+    return {"object": "comment", "id": cid,
+            "discussion_id": data.get("discussion_id"), "action": "edited"}
+
+
+SINGLE_PART_MAX = 20 * 1024 * 1024    # Notion's ceiling for a one-shot upload
+PART_SIZE = 10 * 1024 * 1024          # multi-part: 5-20 MB per part, last smaller
+# Measured 2026-10-08: a free workspace refuses multi-part outright and caps a
+# file at 5 MB; Notion's own message names the limit, so it is passed through.
+UPLOAD_HINT = ("Notion refused the file itself: a free workspace takes files "
+               "up to 5 MB and no multi-part uploads, and some extensions are "
+               "not accepted; nothing was attached")
+
+
+def _send_bytes(c: httpx.Client, up_id: str, name: str, ctype: str,
+                payload: bytes, part: int | None = None) -> None:
     # The bytes go WITHOUT a Content-Type header: multipart sets its own, and
     # the client's application/json silently breaks the upload: the declaration
     # gets a 200 and the result is an empty file.
-    with f.open("rb") as fh:
-        r = httpx.post(upload_url, files={"file": (f.name, fh, ctype)},
-                       headers={"Authorization":
-                                c.headers.get("Authorization", ""),
-                                "Notion-Version": NOTION_VERSION},
-                       timeout=TIMEOUT)
+    r = httpx.post(f"{API_BASE}/file_uploads/{up_id}/send",
+                   files={"file": (name, payload, ctype)},
+                   data={"part_number": str(part)} if part else None,
+                   headers={"Authorization": c.headers.get("Authorization", ""),
+                            "Notion-Version": NOTION_VERSION},
+                   timeout=httpx.Timeout(300.0))
     if r.status_code >= 300:
-        _die(5, "upload_failed", f"upload returned {r.status_code}",
+        _die(5, "upload_failed",
+             f"upload{f' part {part}' if part else ''} returned {r.status_code}",
              r.text[:200])
+
+
+def _upload(c: httpx.Client, src: str) -> tuple[str, str, str]:
+    """Upload a local file or a public URL; return (file_upload id, name, type).
+
+    A file over 20 MB goes in 10 MB parts, which is the only way Notion takes
+    it. A URL is fetched by Notion itself (`external_url` mode), so a file in
+    the cloud never passes through this machine; we wait until Notion says it
+    has it, because attaching a pending upload fails.
+    """
+    import mimetypes, pathlib as _pl
+    from urllib.parse import urlparse, unquote
+    if re.match(r"https?://", src):
+        name = unquote(urlparse(src).path.rsplit("/", 1)[-1]) or "file"
+        ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        up = _request(c, "POST", "/file_uploads",
+                      {"mode": "external_url", "external_url": src,
+                       "filename": name}, validation_hint=UPLOAD_HINT)
+        up_id = up["id"]
+        for _ in range(60):
+            st = _request(c, "GET", f"/file_uploads/{up_id}")
+            if st.get("status") == "uploaded":
+                return up_id, name, st.get("content_type") or ctype
+            if st.get("status") == "failed":
+                res = st.get("file_import_result") or {}
+                _die(5, "import_failed", f"Notion could not fetch {src}",
+                     json.dumps(res.get("error") or res)[:300])
+            time.sleep(2)
+        _die(5, "import_timeout", f"Notion is still fetching {src} after 2 minutes",
+             "try again later; nothing was attached")
+    f = _pl.Path(src).expanduser()
+    if not f.is_file():
+        _die(6, "no_file", f"file not found: {f}")
+    ctype = mimetypes.guess_type(f.name)[0] or "application/octet-stream"
+    size = f.stat().st_size
+    if size <= SINGLE_PART_MAX:
+        up = _request(c, "POST", "/file_uploads",
+                      {"mode": "single_part", "filename": f.name,
+                       "content_type": ctype}, validation_hint=UPLOAD_HINT)
+        _send_bytes(c, up["id"], f.name, ctype, f.read_bytes())
+        return up["id"], f.name, ctype
+    parts = -(-size // PART_SIZE)
+    up = _request(c, "POST", "/file_uploads",
+                  {"mode": "multi_part", "filename": f.name,
+                   "content_type": ctype, "number_of_parts": parts},
+                  validation_hint=UPLOAD_HINT)
+    with f.open("rb") as fh:
+        for n in range(1, parts + 1):
+            _send_bytes(c, up["id"], f.name, ctype, fh.read(PART_SIZE), n)
+    _request(c, "POST", f"/file_uploads/{up['id']}/complete", {})
+    return up["id"], f.name, ctype
+
+
+def cmd_attach(c: httpx.Client, page: str, src: str, caption: str | None,
+               cover: bool = False, icon: bool = False,
+               prop: str | None = None) -> dict:
+    """Put a file into a page: its body (default), its cover, its icon, or a
+    Files column of a database row.
+
+    Notion takes three steps: declare the upload, send the bytes, then attach
+    the finished id. In the body the block type follows the extension: an image
+    shows on the card, everything else becomes a file. A picture that arrives
+    as a `file` block is not visible to the eye, and the whole point of an
+    attachment is that someone looks at it.
+    """
+    if sum(map(bool, (cover, icon, prop))) > 1:
+        _die(6, "input", "--cover, --icon and --property are exclusive")
+    page_id = _to_uuid(page)
+    if prop:
+        # Check the column before uploading: a wrong name should cost nothing.
+        current = _request(c, "GET", f"/pages/{page_id}")
+        col = (current.get("properties") or {}).get(prop)
+        if not col or col.get("type") != "files":
+            have = [k for k, v in (current.get("properties") or {}).items()
+                    if v.get("type") == "files"]
+            _die(6, "no_files_column", f"{prop!r} is not a Files column here",
+                 f"Files columns on this row: {have or 'none'}")
+    up_id, name, ctype = _upload(c, src)
+    ref = {"type": "file_upload", "file_upload": {"id": up_id}}
+    out = {"page_id": page_id, "file": name, "file_upload_id": up_id}
+    if cover or icon:
+        if icon and not ctype.startswith("image/"):
+            _die(6, "not_an_image", f"an icon must be an image, {name} is {ctype}")
+        _request(c, "PATCH", f"/pages/{page_id}",
+                 {"cover" if cover else "icon": ref})
+        return {**out, "to": "cover" if cover else "icon", "action": "attached"}
+    if prop:
+        # Notion replaces a Files column's whole list, so the files already in
+        # it are sent back with the new one. A Notion-hosted file is sent back
+        # by its (signed) url, which Notion accepts as the same file.
+        kept = [{k: v for k, v in x.items() if k in ("name", "type", "file", "external")}
+                for x in col.get("files", [])]
+        for x in kept:
+            if x.get("type") == "file":
+                x["file"] = {"url": x["file"]["url"]}
+        _request(c, "PATCH", f"/pages/{page_id}",
+                 {"properties": {prop: {"files": kept + [{"name": name, **ref}]}}})
+        return {**out, "to": f"property:{prop}", "files_now": len(kept) + 1,
+                "action": "attached"}
     kind = "image" if ctype.startswith("image/") else (
         "video" if ctype.startswith("video/") else
         "pdf" if ctype == "application/pdf" else "file")
-    block: dict = {"type": kind,
-                   kind: {"type": "file_upload", "file_upload": {"id": up_id}}}
+    block: dict = {"type": kind, kind: ref}
     if caption:
         block[kind]["caption"] = [{"text": {"content": caption[:1900]}}]
-    _request(c, "PATCH", f"/blocks/{_to_uuid(page)}/children",
-             {"children": [block]})
-    return {"page_id": _to_uuid(page), "file": f.name, "block": kind,
-            "file_upload_id": up_id, "action": "attached"}
+    _request(c, "PATCH", f"/blocks/{page_id}/children", {"children": [block]})
+    return {**out, "block": kind, "action": "attached"}
 
 
 def cmd_files(c: httpx.Client, page: str) -> dict:
@@ -5653,6 +5971,38 @@ def main() -> None:
     sp.add_argument("--block", action="store_true",
                     help="ref is a block: delete it (e.g. an attachment)")
 
+    sp = sub.add_parser("restore", help="take a page (or --database, --block) out of the trash")
+    sp.add_argument("ref", help="page, database or block UUID or URL")
+    sp.add_argument("--database", action="store_true", help="ref is a database")
+    sp.add_argument("--block", action="store_true", help="ref is a deleted block")
+
+    sp = sub.add_parser("edit", help="replace text on a page, keeping its blocks and comments")
+    sp.add_argument("page", help="page UUID or Notion URL")
+    sp.add_argument("--old", action="append", required=True,
+                    help="text to find (exactly once); repeat with --new")
+    sp.add_argument("--new", action="append", required=True,
+                    help="its replacement (markdown); one per --old")
+    sp.add_argument("--all", action="store_true",
+                    help="replace every match, not just a single one")
+
+    sp = sub.add_parser("insert", help="insert markdown after one line of a page")
+    sp.add_argument("page", help="page UUID or Notion URL")
+    sp.add_argument("--after", required=True,
+                    help="text of the line to insert after, or 'start...end'")
+    sp.add_argument("md", nargs="?", default="-",
+                    help="markdown file path or '-' for stdin (default: stdin)")
+
+    sp = sub.add_parser("block-update", help="rewrite one block's text by its id")
+    sp.add_argument("block", help="block UUID, from `blocks`")
+    sp.add_argument("text", nargs="?", default="-",
+                    help="new text (inline markdown), or '-' for stdin")
+
+    sp = sub.add_parser("search", help="find pages and databases by title")
+    sp.add_argument("query", help="text in the title")
+    sp.add_argument("--type", dest="kind", choices=["page", "database"],
+                    default=None, help="only pages or only databases")
+    sp.add_argument("--limit", type=int, default=20, help="max results (0 = all)")
+
     sp = sub.add_parser("db-create", help="create a database under a page")
     sp.add_argument("--parent", required=True, help="parent page UUID or URL")
     sp.add_argument("--title", default=None, help="database title")
@@ -5751,13 +6101,21 @@ def main() -> None:
     sp = sub.add_parser("comment-delete", help="delete one comment this token wrote")
     sp.add_argument("comment", help="comment id, from `comments`")
 
+    sp = sub.add_parser("comment-edit", help="replace the text of one comment this token wrote")
+    sp.add_argument("comment", help="comment id, from `comments`")
+    sp.add_argument("text", help="new comment text")
+
     sp = sub.add_parser("blocks", help="list a page's or block's child blocks")
     sp.add_argument("page", help="page or block UUID or Notion URL")
 
-    sp = sub.add_parser("attach", help="put a local file into a page's body")
+    sp = sub.add_parser("attach", help="put a file into a page's body, cover, icon or Files column")
     sp.add_argument("page", help="page UUID or Notion URL")
-    sp.add_argument("file", help="local path to the file")
+    sp.add_argument("file", help="local path, or a public http(s) URL Notion fetches")
     sp.add_argument("--caption", help="caption under the block")
+    sp.add_argument("--cover", action="store_true", help="make it the page cover")
+    sp.add_argument("--icon", action="store_true", help="make it the page icon (an image)")
+    sp.add_argument("--property", dest="prop", default=None,
+                    help="add it to this Files column of a database row")
 
     sp = sub.add_parser("files", help="list a page's attachments with fresh URLs")
     sp.add_argument("page", help="page UUID or Notion URL")
@@ -5833,6 +6191,19 @@ def main() -> None:
         elif args.cmd == "archive":
             _emit(cmd_archive(c, args.ref, args.database,
                               getattr(args, "block", False)))
+        elif args.cmd == "restore":
+            _emit(cmd_restore(c, args.ref, args.database, args.block))
+        elif args.cmd == "edit":
+            if len(args.old) != len(args.new):
+                _die(6, "input", "every --old needs its own --new",
+                     f"got {len(args.old)} --old and {len(args.new)} --new")
+            _emit(cmd_edit(c, args.page, list(zip(args.old, args.new)), args.all))
+        elif args.cmd == "insert":
+            _emit(cmd_insert(c, args.page, args.after, _read_md(args.md)))
+        elif args.cmd == "block-update":
+            _emit(cmd_block_update(c, args.block, _read_md(args.text)))
+        elif args.cmd == "search":
+            _emit(cmd_search(c, args.query, args.kind, args.limit))
         elif args.cmd == "db-create":
             _emit(cmd_db_create(c, args.parent, args.title, _read_json(args.props)))
         elif args.cmd == "db-schema":
@@ -5880,10 +6251,13 @@ def main() -> None:
                               args.block))
         elif args.cmd == "comment-delete":
             _emit(cmd_comment_delete(c, args.comment))
+        elif args.cmd == "comment-edit":
+            _emit(cmd_comment_edit(c, args.comment, args.text))
         elif args.cmd == "blocks":
             _emit(cmd_blocks(c, args.page))
         elif args.cmd == "attach":
-            _emit(cmd_attach(c, args.page, args.file, args.caption))
+            _emit(cmd_attach(c, args.page, args.file, args.caption,
+                             args.cover, args.icon, args.prop))
         elif args.cmd == "files":
             _emit(cmd_files(c, args.page))
         elif args.cmd == "download":
