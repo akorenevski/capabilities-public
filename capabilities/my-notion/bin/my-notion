@@ -206,6 +206,13 @@ Commands — comments, files:
                                               the id from `blocks`. Notion's API
                                               anchors to a whole block, never to
                                               a range of text inside it.
+  my-notion comment-delete <comment>           Delete one comment; take its id
+                                              from `comments`. Notion lets a
+                                              token delete only the comments IT
+                                              wrote: anyone else's answers 404,
+                                              exactly like a wrong id, so a 404
+                                              here can mean either. The other
+                                              comments in its thread stay.
   my-notion blocks <page|block>                List the direct child blocks: id,
                                               type, text, has_children. Pass a
                                               block id to walk into nested
@@ -319,7 +326,7 @@ CRED_KEYS = [
 ]
 WRITE_VERBS = {"publish", "append", "create", "upsert",
                "db-create", "db-add", "db-update", "archive",
-               "comment", "attach", "db-alter", "db-meta", "page-meta", "link",
+               "comment", "comment-delete", "attach", "db-alter", "db-meta", "page-meta", "link",
                "view-create", "view-update", "view-delete"}   # domain verbs that mutate Notion
 WRITE_DEFAULT = True    # writes stay inside a workspace the consumer owns
 DOCS_BASE = ""      # upstream guides base URL; "" while no guides ship
@@ -4124,7 +4131,8 @@ def _client(token: str) -> httpx.Client:
 
 
 def _request(client: httpx.Client, method: str, path: str,
-             json_body: dict | None = None) -> dict:
+             json_body: dict | None = None,
+             not_found_hint: str | None = None) -> dict:
     last_status: int | None = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -4171,7 +4179,8 @@ def _request(client: httpx.Client, method: str, path: str,
                 hint = "PAT may not have access to this resource"
             elif notion_code == "object_not_found":
                 exit_code = 3
-                hint = "verify the page UUID and that the PAT can see it"
+                hint = not_found_hint or \
+                    "verify the page UUID and that the PAT can see it"
             elif notion_code == "validation_error":
                 exit_code = 6
                 hint = "check request body shape against Notion API docs"
@@ -5480,6 +5489,22 @@ def cmd_comment(c: httpx.Client, page: str, text: str,
             "action": "commented"}
 
 
+def cmd_comment_delete(c: httpx.Client, comment: str) -> dict:
+    """Delete one comment, e.g. a thread left on the whole page by mistake.
+
+    Notion lets a token delete only the comments it wrote, and answers 404 for
+    anyone else's, the same as for an id that does not exist. The hint says
+    both, so "not mine" is not read as "already gone".
+    """
+    cid = _to_uuid(comment)
+    _request(c, "DELETE", f"/comments/{cid}",
+             not_found_hint="no such comment, or it was written by another "
+                            "token: Notion lets a token delete only its own "
+                            "comments; the author's token deletes it, or a "
+                            "person does in Notion")
+    return {"object": "comment", "id": cid, "action": "deleted"}
+
+
 def cmd_attach(c: httpx.Client, page: str, path: str,
                caption: str | None) -> dict:
     """Put a local file into the page body.
@@ -5723,6 +5748,9 @@ def main() -> None:
     sp.add_argument("--discussion", help="reply into this discussion_id")
     sp.add_argument("--block", help="anchor the new thread on this block id")
 
+    sp = sub.add_parser("comment-delete", help="delete one comment this token wrote")
+    sp.add_argument("comment", help="comment id, from `comments`")
+
     sp = sub.add_parser("blocks", help="list a page's or block's child blocks")
     sp.add_argument("page", help="page or block UUID or Notion URL")
 
@@ -5850,6 +5878,8 @@ def main() -> None:
         elif args.cmd == "comment":
             _emit(cmd_comment(c, args.page, args.text, args.discussion,
                               args.block))
+        elif args.cmd == "comment-delete":
+            _emit(cmd_comment_delete(c, args.comment))
         elif args.cmd == "blocks":
             _emit(cmd_blocks(c, args.page))
         elif args.cmd == "attach":

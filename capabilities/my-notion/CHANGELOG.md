@@ -1,5 +1,9 @@
 # my-notion — change log
 
+## 2026-10-08 — `comment-delete` removes a comment
+
+`my-notion comment-delete <comment>` deletes one comment through `DELETE /v1/comments/{id}`; the id comes from `comments`. Notion lets a token delete only the comments it wrote and answers 404 for anyone else's, the same as for an id that does not exist, so the error hint names both causes. The other comments in the thread stay. It is a write verb: a read-only connection refuses it with exit 4.
+
 ## 2026-10-08 — `comments --blocks` reads the threads left on lines
 
 A thread anchored on a block is filed under that block, so `my-notion comments <page>` does not return it and a page full of line comments reads as empty. `my-notion comments <page> --blocks` also walks the page's blocks, nested ones included and child pages skipped, and returns each block's threads with `block_id` and `block_text`. It makes one request per block. A bare `comments <page>` is unchanged.
