@@ -185,8 +185,15 @@ Commands — views (a view is what makes a database readable):
   my-notion view-delete <view>                 Delete a view.
 
 Commands — comments, files:
-  my-notion comments <page>                    Read the page's comment threads
+  my-notion comments <page> [--blocks]        Read the page's comment threads
                                               (id, discussion_id, author, text).
+                                              A thread on a line belongs to that
+                                              block, not to the page, so a bare
+                                              read misses it; --blocks walks the
+                                              page's blocks (nested ones too, not
+                                              child pages) and adds their threads
+                                              with block_id and block_text. One
+                                              request per block, so slower.
   my-notion comment <page> <text> [--discussion <id>] [--block <id>]
                                               Write a comment. Without
                                               --discussion it opens a new thread;
@@ -5376,9 +5383,31 @@ def cmd_archive(c: httpx.Client, ref: str, is_database: bool,
 # read differently, or we get a board that silently does not see what was
 # written on it. So the refusal is raised as an error, not returned as empty.
 
-def cmd_comments(c: httpx.Client, page: str) -> dict:
-    """A page's (or block's) comment threads, as a flat list."""
+def cmd_comments(c: httpx.Client, page: str, blocks: bool = False) -> dict:
+    """A page's (or block's) comment threads, as a flat list.
+
+    Notion files a thread on a line under that block, and `GET /comments` on
+    the page does not return it, so `blocks` walks the page in document order
+    and reads each block's threads too. Child pages are other pages: skipped.
+    """
     block_id = _to_uuid(page)
+    out = _comments_on(c, block_id)
+
+    def walk(parent_id: str) -> None:
+        for b in cmd_blocks(c, parent_id)["blocks"]:
+            if b["type"] in ("child_page", "child_database"):
+                continue
+            for cm in _comments_on(c, b["id"]):
+                out.append({**cm, "block_id": b["id"], "block_text": b["text"][:80]})
+            if b["has_children"]:
+                walk(b["id"])
+
+    if blocks:
+        walk(block_id)
+    return {"page_id": block_id, "count": len(out), "comments": out}
+
+
+def _comments_on(c: httpx.Client, block_id: str) -> list:
     out, cursor = [], None
     while True:
         q = f"/comments?block_id={block_id}&page_size=100"
@@ -5397,7 +5426,7 @@ def cmd_comments(c: httpx.Client, page: str) -> dict:
         if not data.get("has_more"):
             break
         cursor = data.get("next_cursor")
-    return {"page_id": block_id, "count": len(out), "comments": out}
+    return out
 
 
 def cmd_blocks(c: httpx.Client, parent: str) -> dict:
@@ -5685,6 +5714,8 @@ def main() -> None:
 
     sp = sub.add_parser("comments", help="read comment threads on a page")
     sp.add_argument("page", help="page UUID or Notion URL")
+    sp.add_argument("--blocks", action="store_true",
+                    help="also read the threads on every block of the page")
 
     sp = sub.add_parser("comment", help="write a comment on a page or into a thread")
     sp.add_argument("page", help="page UUID or Notion URL")
@@ -5815,7 +5846,7 @@ def main() -> None:
         elif args.cmd == "db-update":
             _emit(cmd_db_update(c, args.row, _read_json(args.props)))
         elif args.cmd == "comments":
-            _emit(cmd_comments(c, args.page))
+            _emit(cmd_comments(c, args.page, args.blocks))
         elif args.cmd == "comment":
             _emit(cmd_comment(c, args.page, args.text, args.discussion,
                               args.block))
