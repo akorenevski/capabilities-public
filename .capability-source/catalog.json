@@ -2,7 +2,7 @@
   "capabilities": {
     "my-notion": {
       "path": "capabilities/my-notion",
-      "payload_sha256": "b859e0ebe32106e1fa0e15909b3a24b17eea03d24bd99a383a0f177966307cbb",
+      "payload_sha256": "764a34f26f4861b9608e21529efde3faafa32d5b7acfd6290aa1c9bc178edc91",
       "summary": "Notion CLI over the REST API — pages AND databases. Publish markdown, create/upsert pages; create databases, add/query/update rows (data-source model, 2026-03-11), and archive. Personal, multi-workspace."
     }
   }
