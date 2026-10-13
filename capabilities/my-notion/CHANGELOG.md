@@ -1,5 +1,9 @@
 # my-notion — change log
 
+## 2026-10-13 — Reads connections from the store
+
+A project whose `project.json` says `"connections": "store"` (written by `capabilities connections import`) or `"records": "store"` now resolves its connections and grants from the store. Before, my-notion read only a `"store"` key that the manager never writes, fell back to files, and refused every connection as withheld in every imported project. The contract regions are restamped from the official contract (`capabilities-contract==0.4.1`, now pinned in the script header).
+
 ## 2026-10-08 — Edit a page in place, search, restore, edit a comment, attach anywhere
 
 `publish` rebuilds every block, and a comment left on a line is lost with its block. Three verbs now change a page and keep every other block, its id and its threads: `edit <page> --old <text> --new <md>` replaces text through the markdown endpoint's `update_content` (each match must be unique unless `--all`, otherwise Notion refuses and nothing changes); `insert <page> --after <text>` adds markdown after one line; `block-update <block> <text>` rewrites one block's text by its id. Verified against the live API: the edited lines keep their ids and their comments.

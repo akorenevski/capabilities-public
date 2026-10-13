@@ -21,8 +21,10 @@ The contract has three fenced regions; the store tier is canonical in
     references, guide, ids) plus the file/project/IO plumbing. EVERY capability
     carries it, connection-bearing or not.
 
-  - **store** — the records adapter used by identifiers, policy, settings and
-    operational state. EVERY capability carries it because core calls into it.
+  - **store** — the records adapter used by identifiers, policy, settings,
+    connections and documents, kept in files, and a store-mode project's
+    connections and grants, kept in its store. EVERY capability carries it
+    because core calls into it.
 
   - **connections** — the credential cascade and connection resolver. Only a
     capability that implements connections carries this fence. Omitting it is the
@@ -41,6 +43,10 @@ Optionally, beside WRITE_DEFAULT, `MACHINE_READS`: a tuple of the read verbs
 that, outside any project, use the machine's own connections read-only.
 Absent or empty means none; the manager validates it where it validates a
 capability.
+Optionally, beside STATE, `TABLES = True` when the capability keeps tables in
+the machine's store, with a `_tables()` builder outside the fences returning
+`(steps, major, minor)` for the shared database library. Absent or false means
+none, and `migrate` is then left to the CLI's own parser.
 
 The bare `help` verb is dispatched by `_contract` and reads the CLI's help
 body from a module-level `HELP` constant if defined, else the module docstring
@@ -180,9 +186,7 @@ def _project_root() -> Path | None:
             return None
         legacy = d / ".capabilities"
         # Either marker names a project. `settings.json` is the gate and
-        # `project.json` the identity; a project keeping its records in the
-        # store needs the second and may eventually stop carrying the first,
-        # so neither is required while both worlds are in use.
+        # `project.json` the identity; either one alone is enough.
         if ((d / "capabilities" / "settings.json").is_file()
                 or (d / "capabilities" / "project.json").is_file()
                 or (d / ".contextkit" / "config.toml").is_file()
@@ -721,16 +725,28 @@ def _policy_row():
     try:
         row = _records().resolve("capabilities", "policy").get(NAME)
     except StoreError as e:
-        _die(6, e.slug, e.message, e.hint)
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
     if row is None:
         return None
     entry = row.get("value")
     if (not isinstance(entry, dict) or set(entry) != {"enabled"}
             or not isinstance(entry.get("enabled"), bool)):
         _die(6, "bad_policy",
-             f"invalid {NAME} policy entry in {_records().source}",
+             f"invalid {NAME} policy entry in {_policy_source()}",
              'expected {"enabled": true|false}')
     return row
+
+
+def _policy_source() -> str:
+    """Where the gate is kept: the project's envelope, or the store's policy
+    table in a project whose records are in the store."""
+    records = _records()
+    if records.mode_of("policy") != "store":
+        return records.source
+    try:
+        return records.collection_source("capabilities", "policy")
+    except StoreError:
+        return "the store"
 
 
 def _project_enabled_explicitly() -> bool:
@@ -827,6 +843,11 @@ def _gate() -> None:
     machine service checks each opted-in project's own policy before every
     action it takes for that project. `join` is a project act and always takes
     the ordinary path.
+
+    `migrate` of a capability that declares `TABLES` acts on the machine's
+    store rather than for a project, so it too reads no policy row: it answers
+    to the machine ceiling, and `migrate` (not `migrate status`) to the
+    read-only switch.
     """
     _auth_gate()
     verb = sys.argv[1] if len(sys.argv) > 1 else "help"
@@ -834,6 +855,10 @@ def _gate() -> None:
     if not safe:
         _machine_gate()
     service_action = sys.argv[2] if len(sys.argv) > 2 else None
+    if verb == "migrate" and _tables_declared():
+        if service_action != "status":
+            _read_only_gate(f"`{NAME} migrate`")
+        return
     service_contract = globals().get("SERVICE")
     service_call = isinstance(service_contract, dict) and verb == "service"
     machine_service = service_call and isinstance(service_contract.get("machine"), dict)
@@ -854,11 +879,11 @@ def _gate() -> None:
         return
     if isinstance(entry, dict) and entry.get("enabled") is False and scope == "project":
         _die(4, "disabled",
-             f"{NAME} is disabled in this project ({_records().source})",
+             f"{NAME} is disabled in this project ({_policy_source()})",
              f"ask the user whether to enable {NAME} for this project; if yes, "
              f"run `capabilities enable {NAME} --project`")
     if isinstance(entry, dict) and entry.get("enabled") is False:
-        message = f"{NAME} is disabled globally ({_records().source})"
+        message = f"{NAME} is disabled globally ({_policy_source()})"
     else:
         message = f"{NAME} is not enabled by project or global policy"
     _die(4, "not_enabled", message,
@@ -934,28 +959,12 @@ def _env_dir() -> Path | None:
 _RECORDS = None
 
 
-def _store_source_label() -> str:
-    """A credential-free label for the store that answered.
-
-    Core-only capabilities need this just as much as connection-bearing ones,
-    so it belongs with the records adapter rather than in the connections tier.
-    """
-    url = os.environ.get("CAPABILITIES_STORE_URL") or "?"
-    if "://" not in url:
-        return f"store(sqlite:{url})"
-    scheme, rest = url.split("://", 1)
-    if "@" in rest:
-        rest = rest.split("@", 1)[1]
-    return f"store({scheme}://{rest.split('?', 1)[0]})"
-
-
 def _records():
-    """The adapter this project's records are read and written through.
-
-    Everything below takes what this returns and none of it can tell which it
-    got. That is the whole of the arrangement: a call site that can tell where
-    a record lives is a call site that will eventually decide for itself, and
-    then there are two answers to a question that has one."""
+    """The adapter this project's records are read and written through: the
+    project's envelope, then the user's config home; in a project whose
+    connections are in store mode, its store for connections and grants, read
+    for the project's id. Everything below asks it for a collection, never for
+    a path."""
     global _RECORDS
     if _RECORDS is None:
         root = _project_root()
@@ -964,27 +973,14 @@ def _records():
         try:
             project_only = os.environ.get("CAPABILITIES_RECORDS_PROJECT_ONLY", "") \
                 .strip().lower() in ("1", "true", "yes", "on")
+            in_store = root is not None and connections_mode(envelope) == "store"
             _RECORDS = open_records(
-                envelope, _CONFIG_HOME, project_only=project_only)
+                envelope, _CONFIG_HOME, project_only=project_only,
+                project_root=root, project_id=_project_id() if in_store else None,
+                application_name=NAME)
         except StoreError as e:
             _die(6, e.slug, e.message, e.hint)
-        if _RECORDS.mode == "db":
-            _RECORDS.source = _store_source_label()
     return _RECORDS
-
-
-def _store_mode() -> tuple[str, str]:
-    """Where this project keeps its records, as a report rather than a fork.
-
-    Nothing branches on this any more; it is here because a status surface may
-    still want to say which source answered. One project may be moved without moving any other, so the answer is
-    per project and lives beside the project's identity — it has to be readable
-    before the store is reachable.
-
-    The declaration itself is read in one place, `records_mode`, and acted on
-    in one place, `open_records`."""
-    adapter = _records()
-    return (adapter.mode, adapter.source)
 
 
 def _project_identity() -> dict:
@@ -1126,40 +1122,53 @@ def _render_ids_markdown(data: dict) -> str:
     return "\n".join(lines)
 
 
-def _identifiers_scopes() -> "Scopes":
-    identity = _project_identity()
-    return Scopes(project=identity["slug"])
-
-
 def _identifiers_load() -> dict:
-    """The identifiers envelope, from wherever this project keeps its records.
-
-    The shape is the same either way — `{label: {value, note}}` — so the help
-    section, the report and `ids get` never learn which answered."""
+    """The identifiers envelope, resolved through the records adapter, in one
+    shape — `{label: {value, note, scope}}` — for the help section, the report
+    and `ids get`; `scope` names where the value came from, `project` or
+    `global`."""
     try:
         resolved = _records().resolve(NAME, "identifier")
     except StoreError as e:
-        _die(6, e.slug, e.message, e.hint)
-    return {label: {"note": row["note"] or "", "value": row["value"]}
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+    return {label: {"note": row["note"] or "", "value": row["value"],
+                    "scope": row["scope"]}
             for label, row in sorted(resolved.items())}
 
 
-def _identifiers_write(label: str, value, note: str) -> None:
-    """Rule 15 holds either way: a capability is the sole writer of its own
-    identifiers, addressed by (capability, collection) rather than by path."""
-    kept = note or (_identifiers_load().get(label) or {}).get("note", "")
+def _identifiers_scope(scope: str) -> dict:
+    """The identifiers one scope holds itself, without inheritance."""
+    try:
+        return _records().resolve_scope(NAME, "identifier", scope)
+    except StoreError as e:
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+
+
+def _identifiers_stamp(scope: str) -> None:
+    """A project row in the store carries the project id as its agent, so it
+    is written only once the id is verified for this invocation."""
+    if scope == "project" and _records().mode_of("identifier") == "store":
+        _project_id(write=True)
+
+
+def _identifiers_write(label: str, value, note: str, scope: str = "project") -> None:
+    """Rule 15: a capability is the sole writer of its own identifiers,
+    addressed by (capability, collection) rather than by path."""
+    _identifiers_stamp(scope)
+    kept = note or ((_identifiers_scope(scope).get(label) or {}).get("note") or "")
     try:
         _records().set(NAME, "identifier", label, value,
-                       actor=f"{NAME} ids set", note=kept or None)
+                       actor=f"{NAME} ids set", note=kept or None, scope=scope)
     except StoreError as e:
-        _die(6, e.slug, e.message, e.hint)
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
 
 
-def _identifiers_remove(label: str) -> None:
+def _identifiers_remove(label: str, scope: str = "project") -> None:
+    _identifiers_stamp(scope)
     try:
-        _records().delete(NAME, "identifier", label)
+        _records().delete(NAME, "identifier", label, scope=scope)
     except StoreError as e:
-        _die(6, e.slug, e.message, e.hint)
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
 
 
 def _identifiers_section() -> str:
@@ -1199,6 +1208,10 @@ def _cmd_help() -> None:
 
 def _cmd_ids(argv: list[str]) -> None:
     sub = argv[0] if argv else "list"
+    scope = "project"
+    if sub in ("set", "rm") and "--global" in argv[1:]:
+        argv = [a for a in argv if a != "--global"]
+        scope = "global"
     data = _identifiers_load()
     if sub == "list":
         _emit(data); return
@@ -1211,7 +1224,7 @@ def _cmd_ids(argv: list[str]) -> None:
         _read_only_gate(f"`{NAME} ids {sub}`")
     if sub == "set":
         if len(argv) < 3:
-            _die(6, "input", f"usage: {NAME} ids set <label> <value> [--note <text>]")
+            _die(6, "input", f"usage: {NAME} ids set <label> <value> [--note <text>] [--global]")
         label, raw = argv[1], argv[2]
         try:
             value = json.loads(raw)
@@ -1223,14 +1236,18 @@ def _cmd_ids(argv: list[str]) -> None:
             if ni + 1 >= len(argv):
                 _die(6, "input", "--note needs a value")
             note = argv[ni + 1]
-        _identifiers_write(label, value, note)
-        _emit({"set": label}); return
+        _identifiers_write(label, value, note, scope)
+        _emit({"set": label} if scope == "project" else {"set": label, "scope": scope})
+        return
     if sub == "rm":
-        if len(argv) < 2 or argv[1] not in data:
+        held = data if scope == "project" else _identifiers_scope(scope)
+        if len(argv) < 2 or argv[1] not in held:
             _die(3, "not_found", "unknown identifier label",
                  f"`{NAME} ids list` shows the labels")
-        _identifiers_remove(argv[1])
-        _emit({"removed": argv[1]}); return
+        _identifiers_remove(argv[1], scope)
+        _emit({"removed": argv[1]} if scope == "project"
+              else {"removed": argv[1], "scope": scope})
+        return
     _die(6, "input", f"unknown ids subcommand {sub!r}", f"{NAME} ids list|get|set|rm")
 
 
@@ -1254,10 +1271,7 @@ def _front_matter(body: str) -> tuple[str | None, str | None]:
 
 
 def _reference_bodies() -> dict[str, str]:
-    """Every reference this project can see, keyed by its document key.
-
-    In the store a reference is a pinned document like any other long text, so
-    an edit reaches every host at once and an unpinned draft reaches none."""
+    """Every reference this project can see, keyed by its document key."""
     out: dict[str, str] = {}
     try:
         adapter = _records()
@@ -1275,9 +1289,7 @@ def _reference_bodies() -> dict[str, str]:
 def _cmd_refs(argv: list[str] | None = None) -> None:
     """`refs` lists what this project can load; `refs show <name>` prints one.
 
-    The listing carries a `source` rather than a path, because a reference kept
-    in the store has no path to open — `refs show` is the one way to read a
-    body that works whichever source answered."""
+    The listing carries each reference's path; `refs show` prints a body."""
     argv = argv or []
     bodies = _reference_bodies()
     adapter = _records()
@@ -1428,6 +1440,61 @@ def _cmd_inventory(argv: list[str]) -> None:
     _emit(report)
 
 
+# A store setting that cannot be used is a configuration fault; a store that
+# cannot be reached, is busy, or refuses the migration is the environment's.
+_STORE_SETTING_SLUGS = frozenset({
+    "store_not_configured", "store_not_postgres", "store_setting_unreadable",
+    "store_setting_too_new", "bad_store_setting", "sslmode_too_weak",
+    "bad_schema_name", "driver_missing"})
+
+
+def _tables_declared() -> bool:
+    """Whether the capability keeps tables in the machine's store (`TABLES`)."""
+    return bool(globals().get("TABLES"))
+
+
+def _cmd_migrate(argv: list[str]) -> None:
+    """`migrate` applies the capability's pending steps to its tables in the
+    machine's store, through the shared database library and under its lock;
+    `migrate status` reports where they stand, without a lock, changing nothing.
+    The manager runs `migrate` when it installs or updates the payload, and a
+    service runs it when it starts."""
+    if argv not in ([], ["status"]):
+        _die(6, "input", f"unknown migrate arguments {' '.join(argv)!r}",
+             f"{NAME} migrate [status]")
+    steps, major, minor = _tables()
+    try:
+        from capabilities_contract import db
+    except ImportError:
+        _die(6, "driver_missing",
+             "the shared database library capabilities-contract is not installed",
+             f"run {NAME} through its own script header, which pins it")
+    conn = None
+    try:
+        conn = db.connect(application_name=NAME)
+        if argv:
+            found = db.status(conn, NAME, steps, major=major, minor=minor)
+            stored = (None if found.stored_major is None
+                      else {"major": found.stored_major, "minor": found.stored_minor})
+            report = {"owner": found.owner, "schema": found.schema, "state": found.state,
+                      "code": {"major": found.major, "minor": found.minor},
+                      "store": stored, "applied": found.applied,
+                      "pending": found.pending, "changed": found.changed,
+                      "warnings": found.warnings}
+        else:
+            done = db.migrate(conn, NAME, steps, major=major, minor=minor)
+            report = {"owner": done.owner, "schema": done.schema,
+                      "applied": done.applied, "skipped": done.skipped,
+                      "version": {"major": done.major, "minor": done.minor},
+                      "warnings": done.warnings}
+    except db.DbError as exc:
+        _die(6 if exc.slug in _STORE_SETTING_SLUGS else 5, exc.slug, exc.message, exc.hint)
+    finally:
+        if conn is not None:
+            conn.close()
+    _emit(report)
+
+
 MACHINE_READ_EFFECT = ("outside any project these verbs use the machine's own "
                        "connections, read-only; inside a project its grants "
                        "alone decide")
@@ -1495,7 +1562,9 @@ def _contract(argv: list[str]) -> None:
                "docs": {"base": DOCS_BASE,
                         "topics": [entry["topic"] for entry in _guide_menu()]},
                "state": STATE, "inventory": _inventory_declaration(),
-               "post_install": POST_INSTALL})
+               "post_install": POST_INSTALL, "tables": _tables_declared()})
+    elif cmd == "migrate" and _tables_declared():
+        _cmd_migrate(argv[1:])
     elif cmd == "guide":
         _cmd_guide(argv[1:])
     elif cmd == "ids":
@@ -1620,12 +1689,13 @@ def _connections_composed() -> dict:
                                         include_disabled=True,
                                         machine_read=machine)
         default = adapter.get(NAME, "setting", "connection.default")
+        source = adapter.collection_source(NAME, "connection")
     except StoreError as e:
-        _die(6, e.slug, e.message, e.hint)
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
     if not effective:
         _die(6, "connections_required",
              f"{NAME} requires an explicit connections registry and "
-             f"{adapter.source} holds none",
+             f"{source} holds none",
              'expected {"default": "<id>", "connections": {"<id>": { ... }}}')
     usable = {cid: e for cid, e in effective.items() if e["enabled"]}
     withheld = {cid: e for cid, e in effective.items() if not e["enabled"]}
@@ -1747,7 +1817,8 @@ def _write_gate(conn_id: str, allow_write: bool, verb: str) -> None:
         _die(4, "read_only",
              f"connection {conn_id!r} does not allow writes",
              "Do not lift the gate yourself — ask the user; granting is "
-             "`allow_write: true` on this connection in connections.json.")
+             f"`capabilities set {NAME} grant {conn_id} '{{\"allow_write\": true}}'` "
+             "run inside this project.")
 
 
 def _key_report(key: str, secret: bool, required: bool,

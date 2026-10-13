@@ -1,62 +1,46 @@
-"""Canonical store tier — the one true copy of the shared persistence layer.
+"""Canonical store tier — the one true copy of the records layer.
 
-This is the required persistence tier alongside `capability core` and the
-optional `connections` tier in
-`contract/preamble.py`, and it obeys the same law: the helpers between the fence
-markers are COPIED into each `bin/<name>`, never imported, so a manager update
-can never break a deployed capability (SHEBANG.md "spec, never a shared runtime
-library"). Every capability carries it because the core identifiers and policy
-surface resolve through the records adapter.
+This is the required records tier alongside `capability core` and the optional
+`connections` tier in `contract/preamble.py`, and it obeys the same law: the
+helpers between the fence markers are COPIED into each `bin/<name>`, never
+imported, so a manager update can never break a deployed capability (SHEBANG.md
+"spec, never a shared runtime library"). Every capability carries it because the
+core identifiers and policy surface resolve through the records adapter. A
+bundled service carries the same body whole as `service/store.py`.
 
 WHAT THIS TIER OWNS
 ===================
-The records a *running* capability reads and writes: connections, identifiers,
-settings, the policy gate, and operational state. It does not own authoring
-material — a guide, a reference, a doctrine file — which versions in lockstep
-with the code that it describes and stays in the repository.
-
-The test is whether the material must change on a deployed host *without* a
-redeploy. A channel prompt served per request: yes. A capability's own guide:
-no, it is meaningless apart from the version of the code that ships it.
+The records a *running* capability reads and writes: connections, grants,
+identifiers, settings, the policy gate and documents. They are kept in files -
+the project's envelope, then the user's config home - except in a project in
+store mode, which keeps its connections, grants, identifiers and policy in the
+contract's tables in its store (`StoreRecords`); a project that moved only its
+connections and grants there keeps the rest in files. Which database that is,
+like the database any runtime state lives in, is the shared database library's
+answer alone (`capabilities_contract.db`); this tier only asks it.
 
 THREE RESOLUTION SEMANTICS, ALREADY IN THE DOCTRINE
 ===================================================
-Scope is a column here, not a directory, and it has two values: a record
-belongs to one project or to every project, and `project_id` is null in the
-second case. The precedence is always project over global, but *how* the
-scopes combine is declared per collection, because the standing rules already
-contain two different answers and one collection needs a third:
+The precedence is always project over global, but *how* the scopes combine is
+declared per collection:
 
   - MERGE  — per key; a key absent at the higher scope inherits the lower.
     This is rule 17 for the gate ("an absent project entry inherits the global
-    entry"), and it is what makes a scope worth having at all. Connections
-    take it too, at the entry level: rule 18 keeps an identity atomic — taken
-    whole from one scope, never assembled out of two — while letting a project
-    add to the set it inherits rather than replace it.
+    entry"). Connections take it too, at the entry level: rule 18 keeps an
+    identity atomic — taken whole from one scope, never assembled out of two —
+    while letting a project add to the set it inherits rather than replace it.
 
-  - FIRST  — the highest scope holding ANY entry wins, whole. Nothing takes
-    it by default; it is here for the project that must not see the global
-    set at all, where a personal connection showing through would be wrong.
+  - FIRST  — the highest scope holding ANY entry wins, whole.
 
   - EXACT  — no cascade; a record belongs to exactly one scope and is read
-    there. This is rule 16: state follows the scope of the credentials that
-    minted it, so the global scope is not a fallback for a project's.
+    there (rule 16).
 
-ONE WRITER PER SHARED FILE BECOMES ONE WRITER PER COLLECTION
-============================================================
-Rule 15 survives the move intact, addressed by `(capability, collection)`
-instead of by path: the manager alone writes `policy`, a capability alone
-writes its own `identifier` and `state` rows, and `connection` and `setting`
-rows are human-written through a CLI verb. The `revisions` table records who
-wrote what, which is what the repository's history provided before.
-
-MIGRATIONS ARE ADDITIVE
-=======================
-Two hosts running different versions of the same capability will share one
-database. A column added by a newer version must therefore be readable-by-
-absence to the older one: expand in one release, contract only in a later
-release that no live host predates. `migrate()` refuses to run a step that
-drops or narrows, so the rule is mechanical rather than remembered.
+ONE WRITER PER COLLECTION
+=========================
+Rule 15 is addressed by `(capability, collection)` instead of by path: the
+manager alone writes `policy`, a capability alone writes its own `identifier`
+records, and `connection`, `grant`, `setting` and `document` records are
+human-written through a CLI verb.
 
 EXCEPTIONS ARE RAISED, NEVER PRINTED
 ====================================
@@ -71,19 +55,11 @@ import json
 import os
 import hashlib
 import re
-import sqlite3
+import socket
 import time
-from collections.abc import Iterator, Sequence
-from contextlib import contextmanager
-from datetime import datetime as _store_datetime
-from datetime import timedelta as _store_timedelta
-from datetime import timezone as _store_timezone
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote as _store_quote
-from urllib.parse import urlencode as _store_urlencode
-from urllib.parse import urlparse
-from uuid import uuid4
 
 # >>> contract: store (generated — edit contract/store.py, run `capabilities sync-contract`) >>>
 # A region carries what it needs. Relying on the host file to have imported
@@ -94,26 +70,17 @@ import json
 import os
 import hashlib
 import re
-import sqlite3
+import socket
+# The capability core region reads the clock through `time` and imports nothing
+# of its own, so this region keeps carrying it.
 import time
-from collections.abc import Iterator, Sequence
-from contextlib import contextmanager
-from datetime import datetime as _store_datetime
-from datetime import timedelta as _store_timedelta
-from datetime import timezone as _store_timezone
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote as _store_quote
-from urllib.parse import urlencode as _store_urlencode
-from urllib.parse import urlparse
-from uuid import uuid4
 
 
-SCHEMA_VERSION = 4
-
-# Two scopes and no more: a record either belongs to one project or to
-# every project. `project_id` is null in the second case, which is what
-# "global" means and the only thing it means.
+# Two scopes and no more: a record either belongs to one project (the
+# project's envelope) or to every project (the user's config home).
 SCOPE_KINDS = ("global", "project")
 
 FIRST = "first"
@@ -128,7 +95,7 @@ EXACT = "exact"
 # the world, the same in every project forever. What a project may DO with that
 # identity is a decision, different per project by definition. Glued together,
 # the second cannot be overridden without restating the first; apart, a project
-# that needs write access writes one grant row and repeats no address, no host,
+# that needs write access writes one grant and repeats no address, no host,
 # no secret.
 #
 # An identity is atomic: it merges by entry, never by field, so no connection is
@@ -141,10 +108,6 @@ COLLECTIONS: dict[str, dict[str, str]] = {
     "identifier": {"resolve": MERGE, "writer": "capability"},
     "setting": {"resolve": MERGE, "writer": "human"},
     "policy": {"resolve": MERGE, "writer": "manager"},
-    # A document row holds no text — it holds the hash of the version currently
-    # in force. Keeping the pin here rather than in the documents table is what
-    # makes it scoped and merged like everything else, so a project may run a
-    # different version of a globally declared prompt without copying it.
     "document": {"resolve": MERGE, "writer": "human"},
 }
 
@@ -156,9 +119,6 @@ GRANT_FIELDS = ("enabled", "allow_write")
 # A document version is named by the first twelve hex characters of its sha256.
 # Forty-eight bits is far more than a project's worth of prose needs, and a name
 # a person can read at a glance is worth more than headroom nobody will reach.
-# What makes the truncation safe is not the arithmetic but `document_put`, which
-# refuses a hash that already names different text rather than keeping the older
-# body and serving it under the newer name.
 HASH_LENGTH = 12
 
 # A key is a label a human chose, and for a mailbox that label is naturally an
@@ -198,10 +158,139 @@ def read_only_switch() -> bool:
     return os.environ.get(READ_ONLY_ENV, "").strip().lower() in ("1", "true")
 
 
+# The name a machine declares for itself as a node. A container's host name is
+# its container id and changes on every redeploy, so a node that declares one
+# keeps the same name in the store across them.
+NODE_NAME_ENV = "AGENT_NODE_NAME"
+
+
+def node_name() -> str:
+    """The node this process runs on, by the one name the package gives it: a
+    store-mode grant naming a node is matched against it, and a service that
+    records which node holds its work records it. It is the name the machine
+    declares in AGENT_NODE_NAME, and the host name where it declares none."""
+    return os.environ.get(NODE_NAME_ENV, "").strip() or socket.gethostname()
+
+
+def _node_check(node: Any) -> str | None:
+    """A node a policy row is written for: a name, stripped, or None for every
+    node."""
+    if node is None:
+        return None
+    if not isinstance(node, str) or not node.strip():
+        raise StoreError("bad_node", f"node {node!r} must name a node, or be null "
+                         "for every node")
+    return node.strip()
+
+
+# Where a project keeps its records: files (the default) or the store, which
+# then holds its connections, grants, identifiers and policy together. The
+# manager alone writes this key into `project.json`, when it imports a
+# project's files into the store; nothing infers it from a configured store.
+RECORDS_MODE_KEY = "records"
+RECORDS_MODES = ("files", "store")
+
+# The key a project that moved only its connections and grants to the store
+# carries. It keeps meaning exactly that: such a project reads its identifiers
+# and its gate from files until it is imported again.
+CONNECTIONS_MODE_KEY = "connections"
+CONNECTIONS_MODES = ("files", "store")
+
+# The contract's own tables in the store, migrated under the contract's own
+# ledger owner, and the schema version this code writes them at.
+STORE_OWNER = "capabilities"
+STORE_CONNECTIONS_TABLE = "capabilities_connections"
+STORE_GRANTS_TABLE = "capabilities_connection_grants"
+STORE_IDENTIFIERS_TABLE = "capabilities_identifiers"
+STORE_POLICY_TABLE = "capabilities_policy"
+STORE_TABLES_VERSION = (1, 1)
+
+# Which collections each store mode keeps in the store. The default pointer is
+# a setting kept with the grants in both.
+STORE_COLLECTIONS = {
+    CONNECTIONS_MODE_KEY: frozenset({"connection", "grant"}),
+    RECORDS_MODE_KEY: frozenset({"connection", "grant", "identifier", "policy"}),
+}
+STORE_TABLES = {
+    "connection": STORE_CONNECTIONS_TABLE,
+    "grant": STORE_GRANTS_TABLE,
+    "identifier": STORE_IDENTIFIERS_TABLE,
+    "policy": STORE_POLICY_TABLE,
+}
+
+# A store that cannot be reached or is busy is the environment's fault, not
+# the configuration's: a capability maps these to its network exit code.
+STORE_ENVIRONMENT_SLUGS = frozenset({"store_unreachable", "store_busy"})
+
+# How long one process reuses what it read from the store, and a refusal to
+# connect: long enough that one command asks once, short enough that a
+# long-running service sees a changed grant, or a store that came back, at once.
+STORE_READ_SECONDS = 2.0
+
+
+def record_table_steps() -> list[tuple[str, str]]:
+    """The migration steps of the contract's tables. `enabled` and
+    `allow_write` left null decide nothing, as a field absent from a file's
+    grant does; `node` null is the grant, or the policy row, for every node;
+    `agent_id` null is an identifier or a policy row for every project."""
+    return [
+        ("0001-connections",
+         "CREATE TABLE capabilities_connections ("
+         " capability text NOT NULL,"
+         " name text NOT NULL,"
+         " spec jsonb NOT NULL,"
+         " PRIMARY KEY (capability, name),"
+         " CHECK (jsonb_typeof(spec) = 'object'))"),
+        ("0002-connection-grants",
+         "CREATE TABLE capabilities_connection_grants ("
+         " agent_id text NOT NULL,"
+         " capability text NOT NULL,"
+         " connection text NOT NULL,"
+         " node text CHECK (node <> ''),"
+         " enabled boolean,"
+         " allow_write boolean,"
+         " is_default boolean NOT NULL DEFAULT false,"
+         " FOREIGN KEY (capability, connection)"
+         "  REFERENCES capabilities_connections (capability, name)"
+         "  ON DELETE CASCADE ON UPDATE CASCADE)"),
+        ("0003-connection-grants-key",
+         "CREATE UNIQUE INDEX capabilities_connection_grants_key"
+         " ON capabilities_connection_grants"
+         " (agent_id, capability, connection, (coalesce(node, '')))"),
+        ("0004-connection-grants-default",
+         "CREATE UNIQUE INDEX capabilities_connection_grants_default"
+         " ON capabilities_connection_grants"
+         " (agent_id, capability, (coalesce(node, ''))) WHERE is_default"),
+        ("0005-identifiers",
+         "CREATE TABLE capabilities_identifiers ("
+         " agent_id text CHECK (agent_id <> ''),"
+         " capability text NOT NULL,"
+         " label text NOT NULL,"
+         " value jsonb NOT NULL,"
+         " note text NOT NULL DEFAULT '',"
+         " updated_at timestamptz NOT NULL DEFAULT now())"),
+        ("0006-identifiers-key",
+         "CREATE UNIQUE INDEX capabilities_identifiers_key"
+         " ON capabilities_identifiers"
+         " ((coalesce(agent_id, '')), capability, label)"),
+        ("0007-policy",
+         "CREATE TABLE capabilities_policy ("
+         " agent_id text CHECK (agent_id <> ''),"
+         " capability text NOT NULL,"
+         " node text CHECK (node <> ''),"
+         " enabled boolean NOT NULL,"
+         " updated_at timestamptz NOT NULL DEFAULT now())"),
+        ("0008-policy-key",
+         "CREATE UNIQUE INDEX capabilities_policy_key"
+         " ON capabilities_policy"
+         " ((coalesce(agent_id, '')), capability, (coalesce(node, '')))"),
+    ]
+
+
 def _refuse_record_write(capability: str, collection: str) -> None:
     """A project record is the human's or the manager's, so under the switch
-    nothing writes one. Operational state (the `state` rows and a capability's
-    state directory) is not a record and keeps working."""
+    nothing writes one. Operational state (a capability's state directory and
+    its tables in the database) is not a record and keeps working."""
     if read_only_switch():
         raise StoreError(
             "read_only_switch",
@@ -211,1356 +300,57 @@ def _refuse_record_write(capability: str, collection: str) -> None:
             f"run in a process without {READ_ONLY_ENV}.")
 
 
-def _now() -> str:
-    return _store_datetime.now(_store_timezone.utc).isoformat(timespec="seconds")
-
-
-def _now_exact() -> str:
-    """Microsecond resolution, for the one place order matters. A revision log
-    read newest-first used to break ties on a monotonic integer id; a uuid does
-    not order, so the timestamp has to carry the ordering itself."""
-    return _store_datetime.now(_store_timezone.utc).isoformat(timespec="microseconds")
-
-
 def _store_check(name: str, value: str, pattern: re.Pattern) -> str:
     if not isinstance(value, str) or not pattern.fullmatch(value):
         raise StoreError("bad_name", f"{name} {value!r} must match {pattern.pattern}")
     return value
 
 
-def _check_scope(kind: str, name: str) -> tuple[str, str]:
-    if kind not in SCOPE_KINDS:
-        raise StoreError("bad_scope", f"scope kind {kind!r} must be one of {', '.join(SCOPE_KINDS)}")
-    if kind == "global":
-        if name:
-            raise StoreError("bad_scope", "the global scope takes no name")
-        return kind, ""
-    if not name:
-        raise StoreError("bad_scope", f"the {kind} scope requires a name")
-    return kind, name
-
-
-class Scopes:
-    """Which scopes a capability resolves against, highest precedence first.
-
-    Carries the project's SLUG, because that is the handle a person and a
-    project file both use. The store turns it into the project's id once and
-    everything downstream joins on that: the name is the way in, the id is what
-    rows hold."""
-
-    def __init__(self, project: str | None = None, include_global: bool = True):
-        self.project = project or None
-        self.include_global = bool(include_global)
-
-    @classmethod
-    def from_env(cls, project: str | None = None,
-                 include_global: bool = True) -> "Scopes":
-        return cls(project=project or os.environ.get("CAPABILITIES_PROJECT") or None,
-                   include_global=include_global)
-
-    def write_target(self, scope: str | None) -> tuple[str, str | None]:
-        """Where a write lands, as (scope, project slug). A write never guesses
-        a scope it was given no name for."""
-        kind = scope or "project"
-        if kind == "global":
-            return ("global", None)
-        if kind == "project":
-            if not self.project:
-                raise StoreError("no_project_scope", "no project scope is in effect",
-                                 "set CAPABILITIES_PROJECT or pass --scope global")
-            return ("project", self.project)
-        raise StoreError("bad_scope", f"scope {kind!r} must be one of {', '.join(SCOPE_KINDS)}")
-
-    def __repr__(self) -> str:
-        return (f"Scopes(project={self.project!r}, "
-                f"include_global={self.include_global!r})")
-
-
-
-# --- Schema ------------------------------------------------------------------
-
-# Portable DDL. `{json}` and `{now}` are the only dialect substitutions; every
-# other construct below is common to SQLite >= 3.35 and PostgreSQL >= 12.
-_DDL = [
-    """
-    CREATE TABLE IF NOT EXISTS store_meta (
-        namespace   TEXT PRIMARY KEY,
-        version     INTEGER NOT NULL,
-        updated_at  TEXT NOT NULL
-    )
-    """,
-    # A project is looked up by the slug it declares for itself; everything
-    # else refers to it by id. The slug is the handle a person types, the id is
-    # what a row holds, and neither has to do the other's job.
-    """
-    CREATE TABLE IF NOT EXISTS projects (
-        id          TEXT PRIMARY KEY,
-        slug        TEXT NOT NULL UNIQUE,
-        name        TEXT,
-        created_at  TEXT NOT NULL
-    )
-    """,
-    # Where a project sits is a fact about a machine, not about the project.
-    """
-    CREATE TABLE IF NOT EXISTS project_paths (
-        id          TEXT PRIMARY KEY,
-        project_id  TEXT NOT NULL REFERENCES projects(id),
-        instance    TEXT NOT NULL,
-        path        TEXT NOT NULL,
-        updated_at  TEXT NOT NULL,
-        UNIQUE (project_id, instance)
-    )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS config (
-        id          TEXT PRIMARY KEY,
-        scope       TEXT NOT NULL,
-        project_id  TEXT REFERENCES projects(id),
-        capability  TEXT NOT NULL,
-        collection  TEXT NOT NULL,
-        key         TEXT NOT NULL,
-        value       {json} NOT NULL,
-        note        TEXT,
-        updated_at  TEXT NOT NULL,
-        updated_by  TEXT
-    )
-    """,
-    # NULL compares unequal to NULL in a UNIQUE constraint, in both engines, so
-    # a global row would not collide with another global row. The COALESCE makes
-    # the absence of a project a value like any other.
-    """
-    CREATE UNIQUE INDEX IF NOT EXISTS config_identity_idx ON config (
-        scope, COALESCE(project_id, ''), capability, collection, key
-    )
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS config_lookup_idx
-        ON config (capability, collection, scope, project_id)
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS state (
-        id          TEXT PRIMARY KEY,
-        scope       TEXT NOT NULL,
-        project_id  TEXT REFERENCES projects(id),
-        capability  TEXT NOT NULL,
-        key         TEXT NOT NULL,
-        value       {json} NOT NULL,
-        updated_at  TEXT NOT NULL,
-        expires_at  TEXT
-    )
-    """,
-    """
-    CREATE UNIQUE INDEX IF NOT EXISTS state_identity_idx ON state (
-        scope, COALESCE(project_id, ''), capability, key
-    )
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS state_expiry_idx ON state (expires_at)
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS revisions (
-        id          TEXT PRIMARY KEY,
-        scope       TEXT NOT NULL,
-        project_id  TEXT REFERENCES projects(id),
-        capability  TEXT NOT NULL,
-        collection  TEXT NOT NULL,
-        key         TEXT NOT NULL,
-        old_value   {json},
-        new_value   {json},
-        actor       TEXT,
-        written_at  TEXT NOT NULL
-    )
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS revisions_target_idx
-        ON revisions (capability, collection, key, written_at)
-    """,
-    # Long text of any kind — a prompt, a reference, an automation's script.
-    # Versions accumulate and are named by the hash of their own content; which
-    # one is in force is the `active` flag on the row itself, so the answer sits
-    # in the table anyone would look in rather than in a pin somewhere else.
-    """
-    CREATE TABLE IF NOT EXISTS context (
-        id          TEXT PRIMARY KEY,
-        scope       TEXT NOT NULL,
-        project_id  TEXT REFERENCES projects(id),
-        capability  TEXT NOT NULL,
-        key         TEXT NOT NULL,
-        hash        TEXT NOT NULL,
-        body        TEXT NOT NULL,
-        media_type  TEXT,
-        active      INTEGER NOT NULL DEFAULT 0,
-        author      TEXT,
-        created_at  TEXT NOT NULL
-    )
-    """,
-    """
-    CREATE UNIQUE INDEX IF NOT EXISTS context_version_idx ON context (
-        scope, COALESCE(project_id, ''), capability, key, hash
-    )
-    """,
-    # At most one version of one item is in force in one scope, and the database
-    # is what says so — not a convention the writers are trusted to keep.
-    """
-    CREATE UNIQUE INDEX IF NOT EXISTS context_one_active_idx ON context (
-        scope, COALESCE(project_id, ''), capability, key
-    ) WHERE active = 1
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS context_history_idx
-        ON context (capability, key, created_at)
-    """,
-]
-
-
-def _uuid() -> str:
-    return str(uuid4())
-
-
-# --- The repository ----------------------------------------------------------
-
-class Store:
-    """The persistence interface every capability sees. Two adapters implement
-    it; no capability ever writes SQL, which is the single discipline that keeps
-    both backends honest."""
-
-    dialect = "abstract"
-
-    # -- lifecycle ------------------------------------------------------------
-
-    def __init__(self, conn: Any):
-        self._conn = conn
-
-    @property
-    def connection(self) -> Any:
-        return self._conn
-
-    def close(self) -> None:
-        self._conn.close()
-
-    def __enter__(self) -> "Store":
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        self.close()
-
-    # -- dialect hooks --------------------------------------------------------
-
-    def _sql(self, sql: str) -> str:
-        raise NotImplementedError
-
-    def _encode(self, value: Any) -> Any:
-        raise NotImplementedError
-
-    def _decode(self, raw: Any) -> Any:
-        raise NotImplementedError
-
-    def _execute(self, sql: str, params: Sequence[Any] = ()) -> Any:
-        cur = self._conn.cursor()
-        cur.execute(self._sql(sql), tuple(params))
-        return cur
-
-    @contextmanager
-    def transaction(self) -> Iterator[None]:
-        try:
-            yield
-        except Exception:
-            self._conn.rollback()
-            raise
-        self._conn.commit()
-
-    # -- schema ---------------------------------------------------------------
-
-    def migrate(self, namespace: str = "core", version: int = SCHEMA_VERSION,
-                steps: Sequence[str] | None = None) -> int:
-        """Bring `namespace` up to `version`. The core namespace owns the tables
-        above; a capability passes its own namespace and additive steps.
-
-        Refuses a step that drops or narrows, because two hosts on different
-        capability versions share this database and the older one must survive
-        the newer one's migration."""
-        _store_check("namespace", namespace, CAPABILITY_RE)
-        with self.transaction():
-            self._execute(_DDL[0].format(**self._ddl_subs()))
-            cur = self._execute("SELECT version FROM store_meta WHERE namespace = ?", (namespace,))
-            row = cur.fetchone()
-            have = int(row[0]) if row else 0
-            if have >= version:
-                return have
-            body = list(_DDL[1:]) if namespace == "core" and steps is None else list(steps or [])
-            for step in body:
-                self._guard_additive(step)
-                self._execute(step.format(**self._ddl_subs()))
-            if row:
-                self._execute("UPDATE store_meta SET version = ?, updated_at = ? WHERE namespace = ?",
-                              (version, _now(), namespace))
-            else:
-                self._execute("INSERT INTO store_meta (namespace, version, updated_at) VALUES (?, ?, ?)",
-                              (namespace, version, _now()))
-        return version
-
-    @staticmethod
-    def _guard_additive(step: str) -> None:
-        head = " ".join(step.split()).upper()
-        for banned in ("DROP TABLE", "DROP COLUMN", "ALTER COLUMN", "DROP INDEX", "RENAME "):
-            if banned in head:
-                raise StoreError(
-                    "destructive_migration",
-                    f"migration step contains {banned.strip()!r}",
-                    "expand in one release and contract in a later one; a host "
-                    "running the previous version still reads this database",
-                )
-
-    def _ddl_subs(self) -> dict[str, str]:
-        raise NotImplementedError
-
-    def schema_version(self, namespace: str = "core") -> int:
-        cur = self._execute("SELECT version FROM store_meta WHERE namespace = ?", (namespace,))
-        row = cur.fetchone()
-        return int(row[0]) if row else 0
-
-    def health(self) -> dict[str, Any]:
-        """What `doctor` reports: reachable, which dialect, which versions."""
-        started = time.monotonic()
-        self._execute("SELECT 1").fetchone()
-        rtt = round((time.monotonic() - started) * 1000, 1)
-        cur = self._execute("SELECT namespace, version FROM store_meta ORDER BY namespace")
-        return {
-            "dialect": self.dialect,
-            "roundtrip_ms": rtt,
-            "namespaces": {n: int(v) for n, v in cur.fetchall()},
-        }
-
-    # -- scope resolution ------------------------------------------------------
-
-    def _project_id(self, slug: str | None) -> str | None:
-        """A slug in, an id out. Looked up once and remembered, because every
-        query in a session asks the same question about the same project."""
-        if not slug:
-            return None
-        cache = getattr(self, "_project_ids", None)
-        if cache is None:
-            cache = self._project_ids = {}
-        if slug not in cache:
-            cur = self._execute("SELECT id FROM projects WHERE slug = ?", (slug,))
-            row = cur.fetchone()
-            cache[slug] = row[0] if row else None
-        return cache[slug]
-
-    def _chain(self, scopes: Scopes) -> list[tuple[str, str | None]]:
-        """The scopes to read, highest first. A project nobody registered
-        contributes nothing rather than matching everything."""
-        project_id = self._project_id(scopes.project)
-        out: list[tuple[str, str | None]] = []
-        if project_id:
-            out.append(("project", project_id))
-        if scopes.include_global:
-            out.append(("global", None))
-        return out
-
-    def _target(self, scope: tuple) -> tuple[str, str | None]:
-        """A write target as (scope, project id), from a scope and a slug."""
-        kind, slug = (list(scope) + [None])[:2]
-        if kind not in SCOPE_KINDS:
-            raise StoreError("bad_scope",
-                             f"scope {kind!r} must be one of {', '.join(SCOPE_KINDS)}")
-        if kind == "global":
-            if slug:
-                raise StoreError("bad_scope", "the global scope takes no project")
-            return ("global", None)
-        project_id = self._project_id(slug)
-        if not project_id:
-            raise StoreError("unknown_project", f"no project registered as {slug!r}",
-                             "register it before writing records scoped to it")
-        return ("project", project_id)
-
-    @staticmethod
-    def _chain_clause(chain: list) -> tuple[str, list]:
-        if not chain:
-            return "0", []
-        clause = " OR ".join(["(scope = ? AND COALESCE(project_id,'') = ?)"] * len(chain))
-        params: list[Any] = []
-        for kind, pid in chain:
-            params += [kind, pid or ""]
-        return clause, params
-
-    # -- config: read ---------------------------------------------------------
-
-    def config_get(self, capability: str, collection: str, key: str,
-                   scopes: Scopes) -> Any:
-        """One resolved value, or None. Follows the collection's semantics."""
-        entry = self.config_resolve(capability, collection, scopes).get(key)
-        return entry["value"] if entry else None
-
-    def config_layers(self, capability: str, collection: str,
-                      scopes: Scopes) -> list[dict[str, dict[str, Any]]]:
-        """Each scope's own rows, highest scope first, uncollapsed.
-
-        `config_resolve` answers what this project sees; this answers what each
-        scope said. A record whose *fields* are decided one at a time needs the
-        second question, and asking it here keeps one query behind both."""
-        _store_check("capability", capability, CAPABILITY_RE)
-        if self._semantics(collection) == EXACT:
-            raise StoreError("bad_collection",
-                             f"collection {collection!r} is state, not config",
-                             "read it with state_get")
-        chain = self._chain(scopes)
-        clause, params = self._chain_clause(chain)
-        cur = self._execute(
-            "SELECT id, scope, project_id, capability, collection, key, value, "
-            f"note, updated_at, updated_by FROM config WHERE capability = ? AND collection = ? "
-            f"AND ({clause})", [capability, collection] + params)
-        rows = [self._row(r) for r in cur.fetchall()]
-        by_scope: dict[tuple, dict[str, dict[str, Any]]] = {}
-        for row in rows:
-            by_scope.setdefault(
-                (row["scope"], row["project_id"] or ""), {}
-            )[row["key"]] = row
-        return [by_scope[(kind, pid or "")] for kind, pid in chain
-                if by_scope.get((kind, pid or ""))]
-
-    def config_resolve(self, capability: str, collection: str,
-                       scopes: Scopes) -> dict[str, dict[str, Any]]:
-        """The whole collection as the capability should see it, each entry
-        carrying the scope it came from so `connections` can report resolution
-        without a second query."""
-        semantics = self._semantics(collection)
-        out: dict[str, dict[str, Any]] = {}
-        for entries in self.config_layers(capability, collection, scopes):
-            if semantics == FIRST:
-                return entries
-            for key, row in entries.items():
-                out.setdefault(key, row)
-        return out
-
-    def config_origin(self, capability: str, collection: str, key: str,
-                      scopes: Scopes) -> tuple[str, str | None] | None:
-        entry = self.config_resolve(capability, collection, scopes).get(key)
-        return (entry["scope"], entry["project_id"]) if entry else None
-
-    def config_list(self, capability: str, collection: str,
-                    scope: tuple | None = None) -> list[dict[str, Any]]:
-        """Every stored row, unresolved — the view for editing rather than use."""
-        _store_check("capability", capability, CAPABILITY_RE)
-        self._semantics(collection)
-        sql = ("SELECT id, scope, project_id, capability, collection, key, value, "
-               "note, updated_at, updated_by FROM config WHERE capability = ? AND collection = ?")
-        params: list[Any] = [capability, collection]
-        if scope:
-            kind, pid = self._target(scope)
-            sql += " AND scope = ? AND COALESCE(project_id,'') = ?"
-            params += [kind, pid or ""]
-        cur = self._execute(sql + " ORDER BY scope, key", params)
-        return [self._row(r) for r in cur.fetchall()]
-
-    def _row(self, r: Sequence[Any]) -> dict[str, Any]:
-        return {
-            "id": r[0], "scope": r[1], "project_id": r[2],
-            "capability": r[3], "collection": r[4], "key": r[5],
-            "value": self._decode(r[6]), "note": r[7],
-            "updated_at": r[8], "updated_by": r[9],
-        }
-
-    @staticmethod
-    def _semantics(collection: str) -> str:
-        spec = COLLECTIONS.get(collection)
-        if not spec:
-            raise StoreError("bad_collection", f"unknown collection {collection!r}",
-                             f"known: {', '.join(sorted(COLLECTIONS))}")
-        return spec["resolve"]
-
-    # -- config: write --------------------------------------------------------
-
-    def config_set(self, capability: str, collection: str, key: str, value: Any,
-                   scope: tuple, actor: str | None = None,
-                   note: str | None = None) -> str:
-        """Write one entry at one scope and record the revision. Returns the
-        row's id. A write always names its scope; nothing infers one."""
-        _store_check("capability", capability, CAPABILITY_RE)
-        _store_check("key", key, KEY_RE)
-        self._semantics(collection)
-        _refuse_record_write(capability, collection)
-        kind, pid = self._target(scope)
-        with self.transaction():
-            cur = self._execute(
-                "SELECT id, value FROM config WHERE scope = ? AND COALESCE(project_id,'') = ? "
-                "AND capability = ? AND collection = ? AND key = ?",
-                (kind, pid or "", capability, collection, key))
-            existing = cur.fetchone()
-            before = self._decode(existing[1]) if existing else None
-            if existing:
-                row_id = existing[0]
-                self._execute(
-                    "UPDATE config SET value = ?, note = ?, updated_at = ?, updated_by = ? "
-                    "WHERE id = ?",
-                    (self._encode(value), note, _now(), actor, row_id))
-            else:
-                row_id = _uuid()
-                self._execute(
-                    "INSERT INTO config (id, scope, project_id, capability, "
-                    "collection, key, value, note, updated_at, updated_by) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (row_id, kind, pid, capability, collection, key,
-                     self._encode(value), note, _now(), actor))
-            self._revise(kind, pid, capability, collection, key, before, value, actor)
-        return row_id
-
-    def config_delete(self, capability: str, collection: str, key: str,
-                      scope: tuple, actor: str | None = None) -> bool:
-        _store_check("capability", capability, CAPABILITY_RE)
-        self._semantics(collection)
-        _refuse_record_write(capability, collection)
-        kind, pid = self._target(scope)
-        with self.transaction():
-            cur = self._execute(
-                "SELECT id, value FROM config WHERE scope = ? AND COALESCE(project_id,'') = ? "
-                "AND capability = ? AND collection = ? AND key = ?",
-                (kind, pid or "", capability, collection, key))
-            existing = cur.fetchone()
-            if not existing:
-                return False
-            self._execute("DELETE FROM config WHERE id = ?", (existing[0],))
-            self._revise(kind, pid, capability, collection, key,
-                         self._decode(existing[1]), None, actor)
-        return True
-
-    def _revise(self, scope: str, project_id: str | None, capability: str, collection: str, key: str,
-                old: Any, new: Any, actor: str | None) -> None:
-        self._execute(
-            "INSERT INTO revisions (id, scope, project_id, capability, collection, "
-            "key, old_value, new_value, actor, written_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (_uuid(), scope, project_id, capability, collection, key,
-             self._encode(old), self._encode(new), actor, _now_exact()))
-
-    def revisions(self, capability: str, collection: str | None = None,
-                  key: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
-        """What the repository's history used to answer: who changed this, when,
-        and what it was before."""
-        sql = ("SELECT scope, project_id, collection, key, old_value, new_value, "
-               "actor, written_at FROM revisions WHERE capability = ?")
-        params: list[Any] = [capability]
-        if collection:
-            sql += " AND collection = ?"
-            params.append(collection)
-        if key:
-            sql += " AND key = ?"
-            params.append(key)
-        cur = self._execute(sql + " ORDER BY written_at DESC LIMIT ?", params + [limit])
-        return [{"scope": r[0], "project_id": r[1], "collection": r[2],
-                 "key": r[3], "old_value": self._decode(r[4]),
-                 "new_value": self._decode(r[5]), "actor": r[6], "written_at": r[7]}
-                for r in cur.fetchall()]
-
-    # -- connections, with their grants applied --------------------------------
-
-    def connections_effective(self, capability: str, scopes: Scopes,
-                              write_default: bool = False,
-                              include_disabled: bool = False,
-                              machine_read: bool = False) -> dict[str, dict[str, Any]]:
-        """Every connection this project may use, already carrying the decision
-        made about it — the one read a capability needs before it acts.
-
-        `machine_read` is the caller's word that this is one of the
-        capability's declared machine reads outside any project: an identity
-        the machine itself declares is then usable, read-only, unless its grant
-        resolves to `enabled: false`."""
-        identities = self.config_resolve(capability, "connection", scopes)
-        layers = self.config_layers(capability, "grant", scopes)
-        # Under the read-only switch every connection is a source, whatever its
-        # grant or the capability's WRITE_DEFAULT says.
-        writable = not read_only_switch()
-        out: dict[str, dict[str, Any]] = {}
-        for cid, entry in identities.items():
-            rows = [layer[cid] for layer in layers if cid in layer]
-            # Named through the class: this method also runs with a
-            # FileRecords `self`, which carries no store internals.
-            decided, decided_at = Store._grant_decisions(cid, rows)
-            # Where the identity resolves decides whether it is this project's
-            # to use at all. A project that declares an identity locally has
-            # already said yes by declaring it; an identity inherited from the
-            # global scope is withheld until a grant *resolving at project
-            # scope* says `enabled: true`. A global `enabled: true` can never be
-            # the blessing — one global line would otherwise hand every project
-            # on the machine the same connection back.
-            declared = decided.get("enabled")
-            identity_is_project = entry["scope"] == "project"
-            blessed_here = decided_at.get("enabled") == "project"
-            if declared is None:
-                enabled = identity_is_project
-            else:
-                enabled = bool(declared) and (identity_is_project or blessed_here)
-            # A machine read lends the machine's own connection and nothing
-            # more: never a write, and never one a grant switched off.
-            lent = (machine_read and not enabled and entry["scope"] == "global"
-                    and (declared is None or bool(declared)))
-            if lent:
-                enabled = True
-            if not enabled and not include_disabled:
-                continue
-            grant = rows[0] if rows else None
-            out[cid] = {
-                "id": cid,
-                "value": entry["value"],
-                "scope": (entry["scope"], entry["project_id"]),
-                "enabled": enabled,
-                "allow_write": (writable and not lent
-                                and bool(decided.get("allow_write", write_default))),
-                "grant_scope": (grant["scope"], grant["project_id"]) if grant else None,
-            }
-            if lent:
-                out[cid]["machine_read"] = True
-        return out
-
-    @staticmethod
-    def _grant_decisions(cid: str, rows: Sequence[dict[str, Any]]) -> tuple[dict, dict]:
-        """One grant assembled field by field, highest scope first.
-
-        This is the line COLLECTIONS already draws between the two records. An
-        identity is a fact about the world, so it is atomic: taken whole from
-        one scope, never assembled out of two. A grant is a decision, and a
-        decision a lower scope made about one field stands until some higher
-        scope decides that same field — so a machine-wide `allow_write: false`
-        survives a project that only says `enabled: true`, and write permission
-        is never acquired by saying something else.
-
-        Returns the decided fields and, per field, the scope that decided it."""
-        decided: dict[str, Any] = {}
-        decided_at: dict[str, str] = {}
-        for row in rows:
-            value = row["value"]
-            if not isinstance(value, dict):
-                raise StoreError("bad_grant",
-                                 f"grant {cid!r} must be a table, got {type(value).__name__}")
-            unknown = set(value) - set(GRANT_FIELDS)
-            if unknown:
-                raise StoreError("bad_grant",
-                                 f"grant {cid!r} has unknown field(s): {', '.join(sorted(unknown))}",
-                                 f"known: {', '.join(GRANT_FIELDS)}")
-            for field, decision in value.items():
-                if field not in decided:
-                    decided[field] = decision
-                    decided_at[field] = row["scope"]
-        return decided, decided_at
-
-    def grant_orphans(self, capability: str, scopes: Scopes) -> list[dict[str, Any]]:
-        """Grants naming a connection that does not resolve. A grant is the only
-        record that refers to another, so it is the only one that can be aimed at
-        nothing, and dropping it quietly would read exactly like permission
-        deliberately withheld."""
-        identities = self.config_resolve(capability, "connection", scopes)
-        grants = self.config_resolve(capability, "grant", scopes)
-        return [{"key": key, "scope": (row["scope"], row["project_id"]),
-                 "value": row["value"]}
-                for key, row in sorted(grants.items()) if key not in identities]
-
-    # -- context: long text, versioned by content, one version in force --------
-
-    def context_put(self, capability: str, key: str, body: str, scope: tuple,
-                    author: str | None = None, media_type: str | None = None,
-                    activate: bool = False) -> str:
-        """Record a version and return its hash. Saving is not deploying: this
-        changes nothing that runs unless `activate` says so, or until
-        `context_activate` names the hash later."""
-        _store_check("capability", capability, CAPABILITY_RE)
-        _store_check("key", key, KEY_RE)
-        _refuse_record_write(capability, "document")
-        kind, pid = self._target(scope)
-        if not isinstance(body, str):
-            raise StoreError("bad_context", "a context body must be text")
-        digest = hashlib.sha256(body.encode("utf-8")).hexdigest()[:HASH_LENGTH]
-        with self.transaction():
-            cur = self._execute(
-                "SELECT id, body FROM context WHERE scope = ? AND COALESCE(project_id,'') = ? "
-                "AND capability = ? AND key = ? AND hash = ?",
-                (kind, pid or "", capability, key, digest))
-            existing = cur.fetchone()
-            if existing and existing[1] != body:
-                raise StoreError(
-                    "hash_collision",
-                    f"version {digest} of {capability}/{key} already names different text",
-                    "this is what the truncated hash is checked for; report it")
-            if not existing:
-                self._execute(
-                    "INSERT INTO context (id, scope, project_id, capability, key, "
-                    "hash, body, media_type, active, author, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
-                    (_uuid(), kind, pid, capability, key, digest, body,
-                     media_type, author, _now()))
-            if activate:
-                self._activate(kind, pid, capability, key, digest, author)
-        return digest
-
-    def context_activate(self, capability: str, key: str, digest: str, scope: tuple,
-                         actor: str | None = None) -> None:
-        """Put one version in force — the deploy step. At most one version of one
-        item is active in one scope, and the unique index is what says so rather
-        than a convention the writers are trusted to keep."""
-        _refuse_record_write(capability, "document")
-        kind, pid = self._target(scope)
-        with self.transaction():
-            self._activate(kind, pid, capability, key, digest, actor)
-
-    def _activate(self, kind: str, pid: str | None, capability: str, key: str, digest: str, actor: str | None) -> None:
-        cur = self._execute(
-            "SELECT id, hash FROM context WHERE scope = ? AND COALESCE(project_id,'') = ? "
-            "AND capability = ? AND key = ? AND active = 1",
-            (kind, pid or "", capability, key))
-        current = cur.fetchone()
-        target = self._execute(
-            "SELECT id FROM context WHERE scope = ? AND COALESCE(project_id,'') = ? "
-            "AND capability = ? AND key = ? AND hash = ?",
-            (kind, pid or "", capability, key, digest)).fetchone()
-        if not target:
-            raise StoreError("unknown_version",
-                             f"no recorded version {digest} of {capability}/{key} in this scope",
-                             "record it with context_put first")
-        if current and current[0] == target[0]:
-            return
-        # Clear first: the partial unique index would otherwise refuse the second
-        # active row before the old one is stood down.
-        if current:
-            self._execute("UPDATE context SET active = 0 WHERE id = ?", (current[0],))
-        self._execute("UPDATE context SET active = 1 WHERE id = ?", (target[0],))
-        self._revise(kind, pid, capability, "context", key,
-                     current[1] if current else None, digest, actor)
-
-    def context_read(self, capability: str, key: str,
-                     scopes: Scopes) -> dict[str, Any] | None:
-        """The version in force here, found at the highest scope that has one."""
-        for kind, pid in self._chain(scopes):
-            cur = self._execute(
-                "SELECT id, hash, body, media_type, author, created_at, scope, project_id "
-                "FROM context WHERE scope = ? AND COALESCE(project_id,'') = ? "
-                "AND capability = ? AND key = ? AND active = 1",
-                (kind, pid or "", capability, key))
-            row = cur.fetchone()
-            if row:
-                return {"id": row[0], "key": key, "hash": row[1], "body": row[2],
-                        "media_type": row[3], "author": row[4], "created_at": row[5],
-                        "scope": (row[6], row[7])}
-        return None
-
-    def context_versions(self, capability: str, key: str,
-                         scopes: Scopes) -> list[dict[str, Any]]:
-        """Every version this project can see, newest first — its own chain and
-        nothing else. Bodies are omitted; a listing should not carry the whole of
-        what it lists."""
-        clause, params = self._chain_clause(self._chain(scopes))
-        cur = self._execute(
-            "SELECT id, hash, media_type, author, created_at, length(body), active, scope "
-            f"FROM context WHERE capability = ? AND key = ? AND ({clause}) "
-            "ORDER BY created_at DESC, hash", [capability, key] + params)
-        return [{"id": r[0], "hash": r[1], "media_type": r[2], "author": r[3],
-                 "created_at": r[4], "bytes": r[5], "active": bool(r[6]), "scope": r[7]}
-                for r in cur.fetchall()]
-
-    def context_keys(self, capability: str, scopes: Scopes) -> list[str]:
-        clause, params = self._chain_clause(self._chain(scopes))
-        cur = self._execute(
-            f"SELECT DISTINCT key FROM context WHERE capability = ? AND ({clause}) ORDER BY key",
-            [capability] + params)
-        return [r[0] for r in cur.fetchall()]
-
-    # -- the project registry --------------------------------------------------
-
-    def project_register(self, project_id: str, slug: str, name: str | None = None) -> None:
-        """Claim a slug for a project id. Re-registering the same id is how a
-        second machine joins a project it already belongs to. A slug held by a
-        different id is refused: that is another project, and taking its label
-        would take its rows."""
-        _store_check("slug", slug, CAPABILITY_RE)
-        if not isinstance(project_id, str) or not project_id.strip():
-            raise StoreError("bad_project_id", "a project id is required",
-                             "generate one once and keep it in the project's own config")
-        with self.transaction():
-            self._refuse_held_slug(slug, project_id)
-            existing = self._execute(
-                "SELECT slug FROM projects WHERE id = ?", (project_id,)).fetchone()
-            if existing and existing[0] != slug:
-                raise StoreError(
-                    "slug_immutable",
-                    f"project {project_id} is already labelled {existing[0]!r}",
-                    "rows are scoped by the id, but the label is how it is found, "
-                    "so renaming one is `capabilities relabel <slug>` in the "
-                    "project, which moves the label on both sides at once")
-            if existing:
-                self._execute("UPDATE projects SET name = ? WHERE id = ?", (name, project_id))
-            else:
-                self._execute(
-                    "INSERT INTO projects (id, slug, name, created_at) VALUES (?, ?, ?, ?)",
-                    (project_id, slug, name, _now()))
-        getattr(self, "_project_ids", {}).pop(slug, None)
-
-    def _refuse_held_slug(self, slug: str, project_id: str) -> None:
-        """The one reason a label is unavailable, stated once for whoever wants
-        it: another project holds it, and a label is how rows are found."""
-        holder = self._execute("SELECT id FROM projects WHERE slug = ?", (slug,)).fetchone()
-        if holder and holder[0] != project_id:
-            raise StoreError(
-                "slug_taken", f"the label {slug!r} belongs to project {holder[0]}",
-                "pick another label; this is a different project, and sharing "
-                "the label would share its rows")
-
-    def project_relabel(self, project_id: str, slug: str) -> str:
-        """Move a known project's label, keeping its id and therefore its rows.
-
-        This is the migration `project_register` refuses to perform silently.
-        Registration declares who a project is and so must not quietly answer
-        to a second name; relabelling says the project is the same one under a
-        new label, which is a different request and is made deliberately.
-
-        Nothing is re-scoped, because nothing was ever scoped by the label: the
-        id is the column every row carries. Returns the label given up, so a
-        caller can say what changed rather than assume."""
-        _store_check("slug", slug, CAPABILITY_RE)
-        with self.transaction():
-            current = self._execute(
-                "SELECT slug FROM projects WHERE id = ?", (project_id,)).fetchone()
-            if not current:
-                raise StoreError(
-                    "unknown_project", f"no project registered with id {project_id!r}",
-                    "a relabel moves a label a project already holds; there is "
-                    "nothing here to move, and inventing the project instead "
-                    "would claim the label for rows that do not exist")
-            self._refuse_held_slug(slug, project_id)
-            if current[0] != slug:
-                self._execute("UPDATE projects SET slug = ? WHERE id = ?",
-                              (slug, project_id))
-        cache = getattr(self, "_project_ids", {})
-        cache.pop(current[0], None)
-        cache.pop(slug, None)
-        return current[0]
-
-    def project_get(self, slug: str) -> dict[str, Any] | None:
-        row = self._execute(
-            "SELECT id, slug, name, created_at FROM projects WHERE slug = ?", (slug,)).fetchone()
-        return {"id": row[0], "slug": row[1], "name": row[2], "created_at": row[3]} if row else None
-
-    def project_by_id(self, project_id: str) -> dict[str, Any] | None:
-        row = self._execute(
-            "SELECT id, slug, name, created_at FROM projects WHERE id = ?",
-            (project_id,)).fetchone()
-        return {"id": row[0], "slug": row[1], "name": row[2], "created_at": row[3]} if row else None
-
-    def project_list(self) -> list[dict[str, Any]]:
-        cur = self._execute("SELECT id, slug, name, created_at FROM projects ORDER BY slug")
-        return [{"id": r[0], "slug": r[1], "name": r[2], "created_at": r[3]}
-                for r in cur.fetchall()]
-
-    def project_bind_path(self, slug: str, instance: str, path: str) -> None:
-        """Record where this project sits on this machine."""
-        project_id = self._project_id(slug)
-        if not project_id:
-            raise StoreError("unknown_project", f"no project registered as {slug!r}",
-                             "register it first")
-        with self.transaction():
-            existing = self._execute(
-                "SELECT id FROM project_paths WHERE project_id = ? AND instance = ?",
-                (project_id, instance)).fetchone()
-            if existing:
-                self._execute("UPDATE project_paths SET path = ?, updated_at = ? WHERE id = ?",
-                              (path, _now(), existing[0]))
-            else:
-                self._execute(
-                    "INSERT INTO project_paths (id, project_id, instance, path, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?)", (_uuid(), project_id, instance, path, _now()))
-
-    def project_path(self, slug: str, instance: str) -> str | None:
-        project_id = self._project_id(slug)
-        if not project_id:
-            return None
-        row = self._execute(
-            "SELECT path FROM project_paths WHERE project_id = ? AND instance = ?",
-            (project_id, instance)).fetchone()
-        return row[0] if row else None
-
-    # -- state ----------------------------------------------------------------
-
-    def state_get(self, capability: str, key: str, scope: tuple) -> Any:
-        """Rule 16: state is read at exactly the scope that minted it. A
-        project's state is not a fallback for an instance's, so no cascade."""
-        _store_check("capability", capability, CAPABILITY_RE)
-        kind, pid = self._target(scope)
-        row = self._execute(
-            "SELECT value, expires_at FROM state WHERE scope = ? AND COALESCE(project_id,'') = ? "
-            "AND capability = ? AND key = ?",
-            (kind, pid or "", capability, key)).fetchone()
-        if not row or (row[1] and row[1] <= _now()):
-            return None
-        return self._decode(row[0])
-
-    def state_set(self, capability: str, key: str, value: Any, scope: tuple,
-                  ttl_seconds: int | None = None) -> None:
-        _store_check("capability", capability, CAPABILITY_RE)
-        _store_check("key", key, KEY_RE)
-        kind, pid = self._target(scope)
-        expires = None
-        if ttl_seconds is not None:
-            expires = (_store_datetime.now(_store_timezone.utc)
-                       + _store_timedelta(seconds=ttl_seconds)).isoformat(timespec="seconds")
-        with self.transaction():
-            existing = self._execute(
-                "SELECT id FROM state WHERE scope = ? AND COALESCE(project_id,'') = ? "
-                "AND capability = ? AND key = ?",
-                (kind, pid or "", capability, key)).fetchone()
-            if existing:
-                self._execute(
-                    "UPDATE state SET value = ?, updated_at = ?, expires_at = ? WHERE id = ?",
-                    (self._encode(value), _now(), expires, existing[0]))
-            else:
-                self._execute(
-                    "INSERT INTO state (id, scope, project_id, capability, key, "
-                    "value, updated_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (_uuid(), kind, pid, capability, key,
-                     self._encode(value), _now(), expires))
-
-    def state_delete(self, capability: str, key: str, scope: tuple) -> bool:
-        kind, pid = self._target(scope)
-        with self.transaction():
-            cur = self._execute(
-                "DELETE FROM state WHERE scope = ? AND COALESCE(project_id,'') = ? "
-                "AND capability = ? AND key = ?",
-                (kind, pid or "", capability, key))
-        return bool(cur.rowcount)
-
-    def state_sweep(self) -> int:
-        """Drop what has expired. Cheap enough to call on a daemon tick."""
-        with self.transaction():
-            cur = self._execute(
-                "DELETE FROM state WHERE expires_at IS NOT NULL AND expires_at <= ?", (_now(),))
-        return cur.rowcount or 0
-
-
-# --- Adapters ----------------------------------------------------------------
-
-class SQLiteStore(Store):
-    """The single-user local floor. Honest about being that: one writer, no
-    `SKIP LOCKED`, JSON stored as text and unindexed. A project that never
-    leaves one machine needs nothing more."""
-
-    dialect = "sqlite"
-
-    @classmethod
-    def open(cls, path: str) -> "SQLiteStore":
-        conn = sqlite3.connect(path, isolation_level=None, timeout=15.0)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA busy_timeout=15000")
-        return cls(conn)
-
-    def _sql(self, sql: str) -> str:
-        return sql
-
-    def _encode(self, value: Any) -> Any:
-        return None if value is None else json.dumps(value, ensure_ascii=False, sort_keys=True)
-
-    def _decode(self, raw: Any) -> Any:
-        return None if raw is None else json.loads(raw)
-
-    def _ddl_subs(self) -> dict[str, str]:
-        return {"json": "TEXT", "serial": "INTEGER PRIMARY KEY AUTOINCREMENT"}
-
-    @contextmanager
-    def transaction(self) -> Iterator[None]:
-        # BEGIN IMMEDIATE is SQLite's stand-in for the row locks Postgres gives
-        # us: it takes the write lock up front rather than discovering the
-        # conflict at commit.
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
-            yield
-        except Exception:
-            self._conn.execute("ROLLBACK")
-            raise
-        self._conn.execute("COMMIT")
-
-
-class PostgresStore(Store):
-    """The shared backend. Everything the local floor cannot do — concurrent
-    writers, real jsonb, `SKIP LOCKED` for the run queue that lands next — is
-    here, and one host's outage is every host's outage, which is the trade."""
-
-    dialect = "postgres"
-    _PLACEHOLDER = re.compile(r"\?")
-
-    @classmethod
-    def open(cls, url: str) -> "PostgresStore":
-        try:
-            import psycopg2  # imported lazily: a SQLite-only host never pays
-        except ImportError as exc:  # pragma: no cover - depends on host wheels
-            raise StoreError("driver_missing", "psycopg2 is not installed",
-                             "add psycopg2-binary to the capability's script "
-                             "dependencies") from exc
-        try:
-            conn = psycopg2.connect(url, connect_timeout=10)
-        except psycopg2.OperationalError as exc:
-            raise StoreError("store_unreachable", f"cannot reach the store: {exc}",
-                             "the daemon holds rather than fires while the store "
-                             "is unreachable") from exc
-        conn.autocommit = False
-        return cls(conn)
-
-    def _sql(self, sql: str) -> str:
-        return self._PLACEHOLDER.sub("%s", sql)
-
-    def _encode(self, value: Any) -> Any:
-        from psycopg2.extras import Json
-        return None if value is None else Json(value)
-
-    def _decode(self, raw: Any) -> Any:
-        # psycopg2 already adapts jsonb into Python objects.
-        return raw
-
-    def _ddl_subs(self) -> dict[str, str]:
-        return {"json": "JSONB", "serial": "BIGSERIAL PRIMARY KEY"}
-
-
-# --- Resolution --------------------------------------------------------------
-
-def default_store_path() -> str:
-    """Where records live when nothing says otherwise.
-
-    A store is not optional the way a config source is. A queue, a ledger, a
-    cursor have to go somewhere, and letting each capability invent its own
-    database for them is how they came to be scattered in the first place. So
-    there is always one, and the first caller to ask for it creates it.
-
-    The fenced body cannot ask the manager where that is — it may not import a
-    sibling, and a subprocess per open would be absurd — so both compute the
-    same XDG convention independently. That is one convention arrived at twice,
-    not one value stored twice, but the two must agree: `capabilities path
-    store` is the authority, and anything that overrides the location does it
-    through `CAPABILITIES_STORE_URL`, which both read first."""
-    home = os.environ.get("XDG_STATE_HOME") or os.path.join(
-        os.path.expanduser("~"), ".local", "state")
-    return os.path.join(home, "capabilities", "store.db")
-
-
-def open_store(url: str | None = None) -> "Store":
-    """The one entry point. `CAPABILITIES_STORE_URL` is the root pointer that
-    cannot itself live in the store, which is why it is an environment variable
-    beside the secrets the cascade already resolves that way.
-
-    Absent, the local floor is opened at the default path, and created there if
-    nothing has created it yet."""
-    url = url or os.environ.get("CAPABILITIES_STORE_URL") or default_store_path()
-    scheme = urlparse(url).scheme
-    if scheme in ("", "sqlite"):
-        path = urlparse(url).path if scheme == "sqlite" else url
-        if path and path != ":memory:":
-            os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
-    if scheme in ("postgres", "postgresql"):
-        return PostgresStore.open(url)
-    if scheme == "sqlite":
-        return SQLiteStore.open(urlparse(url).path or ":memory:")
-    if not scheme:
-        return SQLiteStore.open(url)
-    raise StoreError("unknown_store", f"unsupported store scheme {scheme!r}",
-                     "expected sqlite:// or postgresql://")
-
-
-
-# --- the machine's store setting ---------------------------------------------
+def _semantics(collection: str) -> str:
+    spec = COLLECTIONS.get(collection)
+    if not spec:
+        raise StoreError("bad_collection", f"unknown collection {collection!r}",
+                         f"known: {', '.join(sorted(COLLECTIONS))}")
+    return spec["resolve"]
+
+
+def _grant_decisions(cid: str, rows: Sequence[dict[str, Any]]) -> tuple[dict, dict]:
+    """One grant assembled field by field, highest scope first.
+
+    This is the line COLLECTIONS already draws between the two records. An
+    identity is a fact about the world, so it is atomic: taken whole from
+    one scope, never assembled out of two. A grant is a decision, and a
+    decision a lower scope made about one field stands until some higher
+    scope decides that same field — so a machine-wide `allow_write: false`
+    survives a project that only says `enabled: true`, and write permission
+    is never acquired by saying something else.
+
+    Returns the decided fields and, per field, the scope that decided it."""
+    decided: dict[str, Any] = {}
+    decided_at: dict[str, str] = {}
+    for row in rows:
+        value = row["value"]
+        if not isinstance(value, dict):
+            raise StoreError("bad_grant",
+                             f"grant {cid!r} must be a table, got {type(value).__name__}")
+        unknown = set(value) - set(GRANT_FIELDS)
+        if unknown:
+            raise StoreError("bad_grant",
+                             f"grant {cid!r} has unknown field(s): {', '.join(sorted(unknown))}",
+                             f"known: {', '.join(GRANT_FIELDS)}")
+        for field, decision in value.items():
+            if field not in decided:
+                decided[field] = decision
+                decided_at[field] = row["scope"]
+    return decided, decided_at
+
+
+# --- records: the files a project keeps its configuration in ------------------
 #
-# Which database a machine's records live in is the machine's, and the whole
-# family of tools on it - the capabilities, ContextKit, AgentKit - shares one
-# answer: the store setting file, `$XDG_CONFIG_HOME/agentkit/store.json`, or
-# `~/.config/agentkit/store.json` when `XDG_CONFIG_HOME` is unset, holding the
-# connection values and the password at mode 0600. Its format is the executable
-# standard's (SHEBANG.md, "The store setting"); in this package the manager is
-# its writer, `capabilities store set`, and whatever reads it reads it here,
-# and reading writes nothing. A Postgres reached across a network is reached
-# over TLS, so the floor on `sslmode` is `require`, and `disable` is admitted
-# only for a store on this machine; it is checked here for the writer and every
-# reader alike.
-#
-# While the file is absent the setting is read where the manager kept it
-# before: the non-secret values in `$XDG_CONFIG_HOME/capabilities/store.json`
-# (`capabilities.store.v1`, binding `agentkit`, or `capabilities.store.v2`,
-# which may name `db_schema`) and the password in the manager's credentials
-# tier beside it. That legacy pair is read, never written.
-
-STORE_SETTING_FORMAT = "agentkit.store.v1"
-STORE_SETTING_FORMAT_PREFIX = "agentkit.store."
-STORE_SETTING_SCHEMA = "capabilities.store.v1"
-STORE_SETTING_SCHEMA_V2 = "capabilities.store.v2"
-STORE_SETTING_SCHEMAS = (STORE_SETTING_SCHEMA, STORE_SETTING_SCHEMA_V2)
-STORE_SCHEMA_FIELD = "db_schema"
-STORE_DEFAULT_SCHEMA = "agentkit"
-STORE_PASSWORD_KEY = "CAPABILITIES_STORE_PASSWORD"
-STORE_URL_OVERRIDES = ("AGENTKIT_STORE_URL", "CAPABILITIES_STORE_URL")
-STORE_SSLMODES = ("require", "verify-ca", "verify-full")
-STORE_SSLMODES_REFUSED = ("disable", "allow", "prefer")
-STORE_SSLMODE_LOCAL = "disable"
-STORE_SETTING_FIELDS = ("host", "port", "database", "user", "sslmode", "sslrootcert")
-STORE_FORMAT_FIELDS = ("schema", *STORE_SETTING_FIELDS, "password", STORE_SCHEMA_FIELD)
-
-
-def _store_config_home(config_home: Path | str | None) -> Path:
-    return Path(config_home or os.environ.get("XDG_CONFIG_HOME")
-                or os.path.join(os.path.expanduser("~"), ".config"))
-
-
-def store_setting_path(config_home: Path | str | None = None) -> Path:
-    """The family's store setting file, as an absolute path."""
-    return Path(os.path.abspath(_store_config_home(config_home) / "agentkit" / "store.json"))
-
-
-def store_setting_files(config_home: Path | str | None = None) -> tuple[Path, Path]:
-    """The legacy setting file and password file, in that order."""
-    home = Path(os.path.abspath(_store_config_home(config_home)))
-    return (home / "capabilities" / "store.json",
-            home / "capabilities" / "credentials.env")
-
-
-def store_url_override() -> tuple[str | None, str | None]:
-    """The override in force and the variable it came from: `AGENTKIT_STORE_URL`,
-    else `CAPABILITIES_STORE_URL`, else (None, None)."""
-    for name in STORE_URL_OVERRIDES:
-        if os.environ.get(name):
-            return os.environ[name], name
-    return None, None
-
-
-def store_host_is_local(host: object) -> bool:
-    """Whether the host is this machine: a Unix socket directory, `localhost`,
-    or a loopback address."""
-    import ipaddress
-    if not isinstance(host, str) or not host:
-        return False
-    if host.startswith("/") or host == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host.strip("[]")).is_loopback
-    except ValueError:
-        return False
-
-
-def check_store_setting(values: dict) -> dict:
-    """The setting's non-secret values, checked and normalised, or StoreError."""
-    if not isinstance(values, dict):
-        raise StoreError("bad_store_setting", "the store setting is not an object")
-    unknown = sorted(set(values) - set(STORE_SETTING_FIELDS))
-    if unknown:
-        raise StoreError("bad_store_setting",
-                         f"the store setting carries unknown fields: {', '.join(unknown)}")
-    out: dict = {}
-    for field in ("host", "database", "user"):
-        value = values.get(field)
-        if not isinstance(value, str) or not value or any(
-                ch.isspace() or ch == "\0" for ch in value):
-            raise StoreError("bad_store_setting",
-                             f"the store setting needs a {field} with no whitespace")
-        out[field] = value
-    port = values.get("port", 5432)
-    if isinstance(port, str) and port.isdigit():
-        port = int(port)
-    if isinstance(port, bool) or not isinstance(port, int) or not 0 < port < 65536:
-        raise StoreError("bad_store_setting", "the store port must be 1-65535")
-    out["port"] = port
-    sslmode = values.get("sslmode")
-    local = sslmode == STORE_SSLMODE_LOCAL and store_host_is_local(out["host"])
-    if sslmode in STORE_SSLMODES_REFUSED and not local:
-        raise StoreError("sslmode_too_weak",
-                         f"sslmode {sslmode!r} lets the store be reached without TLS",
-                         f"use one of {', '.join(STORE_SSLMODES)}; disable is "
-                         "admitted only for a local host or Unix socket")
-    if sslmode not in STORE_SSLMODES and not local:
-        raise StoreError("bad_store_setting", f"unknown sslmode {sslmode!r}",
-                         f"use one of {', '.join(STORE_SSLMODES)}")
-    out["sslmode"] = sslmode
-    root = values.get("sslrootcert")
-    if root is not None:
-        if not isinstance(root, str) or not root or "\n" in root:
-            raise StoreError("bad_store_setting",
-                             "sslrootcert must be a certificate file path or `system`")
-        out["sslrootcert"] = root
-    return out
-
-
-def check_store_schema_name(name: object) -> str:
-    """A schema the store may be bound to: a lowercase identifier, never
-    `public` and never a system schema."""
-    if not isinstance(name, str) or not re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", name):
-        raise StoreError("bad_schema_name",
-                         f"schema name {name!r} is not a lowercase identifier",
-                         "use letters, digits and underscores, starting with a letter or _")
-    if name in ("public", "information_schema") or name.startswith("pg_"):
-        raise StoreError("bad_schema_name", f"schema {name!r} is reserved",
-                         f"name a schema of the store's own, such as {STORE_DEFAULT_SCHEMA}")
-    return name
-
-
-def store_setting_version(path: Path) -> str | None:
-    """The format version the file at `path` declares, or None when it is
-    absent or declares none. A writer reads this before it replaces the file,
-    and never replaces a version it does not know."""
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, ValueError):
-        return None
-    version = data.get("schema") if isinstance(data, dict) else None
-    return version if isinstance(version, str) else None
-
-
-def store_setting_document(setting: dict, password: str | None,
-                           schema: str | None = None) -> dict:
-    """The file a writer writes: the lowest format version that expresses the
-    setting, `db_schema` only when one is named, `password` only when there is
-    one."""
-    values = check_store_setting(setting)
-    document = {"schema": STORE_SETTING_FORMAT, **values}
-    if password:
-        document["password"] = password
-    if schema is not None:
-        document[STORE_SCHEMA_FIELD] = check_store_schema_name(schema)
-    return document
-
-
-def _read_family_store_setting(path: Path, raw: str) -> tuple[dict, bool]:
-    try:
-        data = json.loads(raw)
-    except ValueError as exc:
-        raise StoreError("bad_store_setting", f"{path} is not a store setting",
-                         "rewrite it with `capabilities store set`") from exc
-    version = data.get("schema") if isinstance(data, dict) else None
-    if isinstance(version, str) and version.startswith(STORE_SETTING_FORMAT_PREFIX) \
-            and version != STORE_SETTING_FORMAT:
-        raise StoreError("store_setting_too_new",
-                         f"{path} is a {version} setting, which this tool does not know",
-                         "update this tool; the setting was written by a newer one")
-    if version != STORE_SETTING_FORMAT:
-        raise StoreError("bad_store_setting", f"{path} is not a {STORE_SETTING_FORMAT} setting",
-                         "rewrite it with `capabilities store set`")
-    unknown = sorted(set(data) - set(STORE_FORMAT_FIELDS))
-    if unknown:
-        raise StoreError("bad_store_setting",
-                         f"{path} carries fields {STORE_SETTING_FORMAT} does not have: "
-                         f"{', '.join(unknown)}",
-                         "rewrite it with `capabilities store set`")
-    setting = check_store_setting(
-        {k: v for k, v in data.items() if k in STORE_SETTING_FIELDS})
-    named = data.get(STORE_SCHEMA_FIELD) is not None
-    setting[STORE_SCHEMA_FIELD] = (check_store_schema_name(data[STORE_SCHEMA_FIELD])
-                                   if named else STORE_DEFAULT_SCHEMA)
-    password = data.get("password")
-    if password is not None and (not isinstance(password, str) or "\n" in password):
-        raise StoreError("bad_store_setting", f"{path} carries a password that is not one line")
-    setting["password"] = password or None
-    return setting, named
-
-
-def _read_legacy_store_setting(config_home: Path | str | None) -> tuple[dict, bool] | None:
-    setting_file, password_file = store_setting_files(config_home)
-    try:
-        raw = setting_file.read_text()
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        raise StoreError("store_setting_unreadable",
-                         f"cannot read the store setting {setting_file}: {exc}") from exc
-    try:
-        data = json.loads(raw)
-    except ValueError as exc:
-        raise StoreError("bad_store_setting",
-                         f"{setting_file} is not a store setting",
-                         "rewrite it with `capabilities store set`") from exc
-    if not isinstance(data, dict) or data.get("schema") not in STORE_SETTING_SCHEMAS:
-        raise StoreError("bad_store_setting",
-                         f"{setting_file} is not a "
-                         f"{' or '.join(STORE_SETTING_SCHEMAS)} setting",
-                         "rewrite it with `capabilities store set`")
-    setting = check_store_setting(
-        {k: v for k, v in data.items() if k in STORE_SETTING_FIELDS})
-    setting[STORE_SCHEMA_FIELD] = STORE_DEFAULT_SCHEMA
-    named = data["schema"] == STORE_SETTING_SCHEMA_V2 and data.get(STORE_SCHEMA_FIELD) is not None
-    if named:
-        setting[STORE_SCHEMA_FIELD] = check_store_schema_name(data[STORE_SCHEMA_FIELD])
-    setting["password"] = None
-    try:
-        lines = password_file.read_text().splitlines()
-    except FileNotFoundError:
-        lines = []
-    except OSError as exc:
-        raise StoreError("store_setting_unreadable",
-                         f"cannot read the store password file {password_file}: {exc}") from exc
-    prefix = STORE_PASSWORD_KEY + "="
-    for line in lines:
-        if line.startswith(prefix):
-            setting["password"] = line[len(prefix):] or None
-    return setting, named
-
-
-def find_store_setting(config_home: Path | str | None = None) -> tuple[dict | None, dict]:
-    """This machine's store setting, or None, and where it was found.
-
-    The second value is `{path, exists, read, db_schema_named}`: the family
-    file's absolute path, whether it exists, `family` or `legacy` for where the
-    setting was read (None when there is none), and whether the setting names
-    its schema rather than taking the default. The family file is read when it
-    exists; the legacy pair only when it does not. This reads and never writes."""
-    path = store_setting_path(config_home)
-    where = {"path": str(path), "exists": False, "read": None, "db_schema_named": False}
-    try:
-        raw = path.read_text()
-    except FileNotFoundError:
-        raw = None
-    except OSError as exc:
-        raise StoreError("store_setting_unreadable",
-                         f"cannot read the store setting {path}: {exc}") from exc
-    if raw is not None:
-        where["exists"] = True
-        setting, named = _read_family_store_setting(path, raw)
-        where.update(read="family", db_schema_named=named)
-        return setting, where
-    legacy = _read_legacy_store_setting(config_home)
-    if legacy is None:
-        return None, where
-    setting, named = legacy
-    where.update(read="legacy", db_schema_named=named)
-    return setting, where
-
-
-def read_store_setting(config_home: Path | str | None = None) -> dict | None:
-    """This machine's store setting, or None when it has none.
-
-    The values `host`, `port`, `database`, `user`, `sslmode`, `sslrootcert`
-    when set, `db_schema` (the named schema, else `agentkit`) and `password`
-    (None when there is none), from the family file or, while it is absent,
-    the legacy pair. This reads and never writes."""
-    return find_store_setting(config_home)[0]
-
-
-def store_setting_url(setting: dict, *, with_password: bool = True,
-                      sslmode: str | None = None) -> str:
-    """The setting as a `postgresql://` URL; `sslmode` replaces the setting's
-    own only for a caller proving what the server refuses."""
-    user = _store_quote(setting["user"], safe="")
-    if with_password and setting.get("password"):
-        user += ":" + _store_quote(setting["password"], safe="")
-    host = setting["host"]
-    query = {"sslmode": sslmode or setting["sslmode"]}
-    if setting.get("sslrootcert"):
-        query["sslrootcert"] = setting["sslrootcert"]
-    database = _store_quote(setting["database"], safe="")
-    if host.startswith("/"):
-        # A Unix socket directory cannot sit in the authority, so it and the
-        # port travel as parameters.
-        query = {"host": host, "port": str(setting["port"]), **query}
-        return f"postgresql://{user}@/{database}?{_store_urlencode(query)}"
-    if ":" in host and not host.startswith("["):
-        host = f"[{host}]"
-    return (f"postgresql://{user}@{host}:{setting['port']}/"
-            f"{database}?{_store_urlencode(query)}")
-
-# --- records: the two places a project may keep its configuration ------------
-#
-# Tracking is not on this axis. Runs, queues and cursors live in the store
-# always, because a ledger with a files mode is a ledger nothing can query.
-# What a project chooses is where its CONFIGURATION is read and written, and
-# these two answer that. A capability calls the same verbs either way and is
-# never told which answered, which is the whole point: a call site that can
-# tell is a call site that will eventually decide.
+# Runtime state is not on this axis: runs, queues and cursors a capability's
+# processes share live in its tables in the database. What this answers is
+# where CONFIGURATION is read and written. A capability calls the verbs below
+# and never a path, so the layout is described in one place.
 
 DOCUMENT_LOCATIONS: tuple[tuple[str | None, str, str], ...] = (
     ("reference", "{cap}/reference", ".md"),
@@ -1579,13 +369,15 @@ def _document_key(prefix: str | None, stem: str) -> str:
 
 
 class Records:
-    """The surface a capability reads and writes its configuration through.
-
-    Every verb here is answered by both a directory of files and a database.
-    Neither is asked which it is."""
+    """The surface a capability reads and writes its configuration through."""
 
     mode = "?"
     source = "?"
+
+    def mode_of(self, collection: str, key: str | None = None) -> str:
+        """Where one collection is kept: `files`, or `store` for what a
+        project in store mode keeps there."""
+        return self.mode
 
     def __enter__(self) -> "Records":
         return self
@@ -1602,104 +394,19 @@ class Records:
         raise NotImplementedError
 
 
-class StoreRecords(Records):
-    """Configuration kept as rows. Thin, because the store already does this —
-    what this adds is a fixed project, so no call site carries a scope it could
-    forget."""
+# A policy record says which node its row names. Files carry no node, so every
+# policy record read from them names none: it is the record for every node.
+_FILE_NODE = {"policy": {"node": None}}
 
-    mode = "db"
 
-    def __init__(self, store: "Store", scopes: "Scopes", write_scope: tuple):
-        self.store, self.scopes, self.write_scope = store, scopes, write_scope
-        self.source = getattr(store, "label", "store")
-
-    def close(self) -> None:
-        self.store.close()
-
-    def resolve(self, capability: str, collection: str) -> dict[str, dict[str, Any]]:
-        return self.store.config_resolve(capability, collection, self.scopes)
-
-    def resolve_scope(self, capability: str, collection: str,
-                      scope: str) -> dict[str, dict[str, Any]]:
-        if scope == "project":
-            scopes = Scopes(project=self.scopes.project, include_global=False)
-        elif scope == "global":
-            scopes = Scopes(project=None, include_global=True)
-        else:
-            raise StoreError("bad_scope",
-                             f"scope {scope!r} must be one of {', '.join(SCOPE_KINDS)}")
-        return self.store.config_resolve(capability, collection, scopes)
-
-    def get(self, capability: str, collection: str, key: str) -> Any:
-        return self.store.config_get(capability, collection, key, self.scopes)
-
-    def set(self, capability: str, collection: str, key: str, value: Any,
-            actor: str | None = None, note: str | None = None,
-            scope: str | None = None) -> None:
-        target = self.write_scope if scope is None else (
-            ("global", "") if scope == "global"
-            else ("project", self.scopes.project) if scope == "project"
-            else None)
-        if target is None:
-            raise StoreError("bad_scope",
-                             f"scope {scope!r} must be one of {', '.join(SCOPE_KINDS)}")
-        self.store.config_set(capability, collection, key, value,
-                              target, actor=actor, note=note)
-
-    def delete(self, capability: str, collection: str, key: str,
-               scope: str | None = None) -> bool:
-        target = self.write_scope if scope is None else (
-            ("global", "") if scope == "global"
-            else ("project", self.scopes.project) if scope == "project"
-            else None)
-        if target is None:
-            raise StoreError("bad_scope",
-                             f"scope {scope!r} must be one of {', '.join(SCOPE_KINDS)}")
-        return self.store.config_delete(capability, collection, key, target)
-
-    def connections(self, capability: str, write_default: bool = False,
-                    include_disabled: bool = False,
-                    machine_read: bool = False) -> dict[str, dict[str, Any]]:
-        return self.store.connections_effective(
-            capability, self.scopes, write_default=write_default,
-            include_disabled=include_disabled, machine_read=machine_read)
-
-    def document_read(self, capability: str, key: str) -> dict[str, Any] | None:
-        return self.store.context_read(capability, key, self.scopes)
-
-    def document_keys(self, capability: str) -> list[str]:
-        return self.store.context_keys(capability, self.scopes)
-
-    def collection_source(self, capability: str, collection: str) -> str:
-        """What answered. A row has no path, so the store says so as itself."""
-        return self.source
-
-    def scope_source(self, capability: str, collection: str, scope: str) -> str:
-        """What answered, for one scope. A row has no path at any scope, so
-        every scope answers as the store itself does."""
-        return self.source
-
-    def document_path(self, capability: str, key: str) -> Path | None:
-        """Nothing to open: a version in the store is not a file anywhere. The
-        working copy an edit needs is the caller's to make, and `put` is what
-        makes it land."""
-        return None
-
-    def document_put(self, capability: str, key: str, body: str,
-                     author: str | None = None, media_type: str | None = None,
-                     base: str | None = None) -> str:
-        if base is not None:
-            current = self.store.context_read(capability, key, self.scopes)
-            live = current["hash"] if current else None
-            if live != base:
-                raise StoreError(
-                    "stale_edit",
-                    f"{capability}/{key} was {live or 'absent'} when this landed, "
-                    f"not {base} as it was when the edit began",
-                    "re-read it and apply the change again")
-        return self.store.context_put(capability, key, body, self.write_scope,
-                                      author=author, media_type=media_type,
-                                      activate=True)
+def _files_carry_no_node(node: Any) -> None:
+    if node is not None:
+        raise StoreError(
+            "node_requires_store",
+            "a policy row naming a node is kept only in the store: files carry no "
+            "node, so a record written there is for every node",
+            "import this project's records into its store with `capabilities "
+            "connections import`, then write the row for the node")
 
 
 class FileRecords(Records):
@@ -1763,14 +470,13 @@ class FileRecords(Records):
                 return root / capability / "connections.json"
             return root / capability / "service" / "settings.json"
         raise StoreError("bad_collection",
-                         f"collection {collection!r} is not kept in files",
-                         "it exists only where the project keeps records in the store")
+                         f"collection {collection!r} is not kept in files")
 
     # -- reading ---------------------------------------------------------------
 
     def _entries(self, root: Path, capability: str, collection: str) -> dict[str, Any]:
-        """Every entry of one collection held at one scope, keyed as the store
-        keys them, so the two agree on what a record is called."""
+        """Every entry of one collection held at one scope, keyed by the name a
+        record answers to."""
         if collection == "policy":
             body = self._load(self._policy_file(root)) or {}
             return dict((body.get("capabilities") or {}))
@@ -1818,10 +524,9 @@ class FileRecords(Records):
 
     def config_layers(self, capability: str, collection: str,
                       _scopes: Any = None) -> list[dict[str, dict[str, Any]]]:
-        """Each scope's own rows, highest scope first, uncollapsed — the same
-        question `Store.config_layers` answers, asked of the two directories."""
+        """Each scope's own entries, highest scope first, uncollapsed."""
         _store_check("capability", capability, CAPABILITY_RE)
-        Store._semantics(collection)
+        _semantics(collection)
         layers: list[dict[str, dict[str, Any]]] = []
         for scope, pid, root in self._chain():
             entries = self._entries(root, capability, collection)
@@ -1832,13 +537,14 @@ class FileRecords(Records):
                       "project_id": pid, "capability": capability,
                       "collection": collection, "key": key, "value": value,
                       "note": self._note(root, capability, collection, key),
-                      "updated_at": None, "updated_by": None}
+                      "updated_at": None, "updated_by": None,
+                      **_FILE_NODE.get(collection, {})}
                 for key, value in entries.items()
             })
         return layers
 
     def resolve(self, capability: str, collection: str) -> dict[str, dict[str, Any]]:
-        semantics = Store._semantics(collection)
+        semantics = _semantics(collection)
         out: dict[str, dict[str, Any]] = {}
         for rows in self.config_layers(capability, collection):
             if semantics == FIRST:
@@ -1880,7 +586,8 @@ class FileRecords(Records):
                   "capability": capability, "collection": collection,
                   "key": key, "value": value,
                   "note": self._note(root, capability, collection, key),
-                  "updated_at": None, "updated_by": None}
+                  "updated_at": None, "updated_by": None,
+                  **_FILE_NODE.get(collection, {})}
             for key, value in self._entries(root, capability, collection).items()
         }
 
@@ -1909,26 +616,67 @@ class FileRecords(Records):
     def connections(self, capability: str, write_default: bool = False,
                     include_disabled: bool = False,
                     machine_read: bool = False) -> dict[str, dict[str, Any]]:
-        """Assembled exactly as the store assembles it, from the same two
-        collections, so a project changing where it keeps records does not
-        change which connection answers."""
-        return Store.connections_effective(
-            self, capability, None, write_default=write_default,
-            include_disabled=include_disabled, machine_read=machine_read)
+        """Every connection this project may use, already carrying the decision
+        made about it — the one read a capability needs before it acts.
 
-    def config_resolve(self, capability: str, collection: str, _scopes: Any) -> dict:
-        """`connections_effective` reaches for this name; the scopes it passes
-        are already fixed here."""
-        return self.resolve(capability, collection)
+        `machine_read` is the caller's word that this is one of the
+        capability's declared machine reads outside any project: an identity
+        the machine itself declares is then usable, read-only, unless its grant
+        resolves to `enabled: false`."""
+        identities = self.resolve(capability, "connection")
+        layers = self.config_layers(capability, "grant")
+        # Under the read-only switch every connection is a source, whatever its
+        # grant or the capability's WRITE_DEFAULT says.
+        writable = not read_only_switch()
+        out: dict[str, dict[str, Any]] = {}
+        for cid, entry in identities.items():
+            rows = [layer[cid] for layer in layers if cid in layer]
+            decided, decided_at = _grant_decisions(cid, rows)
+            # Where the identity resolves decides whether it is this project's
+            # to use at all. A project that declares an identity locally has
+            # already said yes by declaring it; an identity inherited from the
+            # global scope is withheld until a grant *resolving at project
+            # scope* says `enabled: true`. A global `enabled: true` can never be
+            # the blessing — one global line would otherwise hand every project
+            # on the machine the same connection back.
+            declared = decided.get("enabled")
+            identity_is_project = entry["scope"] == "project"
+            blessed_here = decided_at.get("enabled") == "project"
+            if declared is None:
+                enabled = identity_is_project
+            else:
+                enabled = bool(declared) and (identity_is_project or blessed_here)
+            # A machine read lends the machine's own connection and nothing
+            # more: never a write, and never one a grant switched off.
+            lent = (machine_read and not enabled and entry["scope"] == "global"
+                    and (declared is None or bool(declared)))
+            if lent:
+                enabled = True
+            if not enabled and not include_disabled:
+                continue
+            grant = rows[0] if rows else None
+            out[cid] = {
+                "id": cid,
+                "value": entry["value"],
+                "scope": (entry["scope"], entry["project_id"]),
+                "enabled": enabled,
+                "allow_write": (writable and not lent
+                                and bool(decided.get("allow_write", write_default))),
+                "grant_scope": (grant["scope"], grant["project_id"]) if grant else None,
+            }
+            if lent:
+                out[cid]["machine_read"] = True
+        return out
 
     # -- writing ---------------------------------------------------------------
 
     def set(self, capability: str, collection: str, key: str, value: Any,
             actor: str | None = None, note: str | None = None,
-            scope: str | None = None) -> None:
+            scope: str | None = None, node: str | None = None) -> None:
         _store_check("capability", capability, CAPABILITY_RE)
         _store_check("key", key, KEY_RE)
-        Store._semantics(collection)
+        _semantics(collection)
+        _files_carry_no_node(node)
         _refuse_record_write(capability, collection)
         target_scope = scope or "project"
         if target_scope not in SCOPE_KINDS:
@@ -1967,7 +715,8 @@ class FileRecords(Records):
         self._save(path, body, sort=collection == "identifier")
 
     def delete(self, capability: str, collection: str, key: str,
-               scope: str | None = None) -> bool:
+               scope: str | None = None, node: str | None = None) -> bool:
+        _files_carry_no_node(node)
         _refuse_record_write(capability, collection)
         target_scope = scope or "project"
         if target_scope not in SCOPE_KINDS:
@@ -2080,8 +829,8 @@ class FileRecords(Records):
     # -- what a directory cannot answer ---------------------------------------
 
     def _refuse(self, what: str) -> None:
-        raise StoreError("files_mode", f"{what} needs records kept in the store",
-                         "this project keeps them in files, where there is no history")
+        raise StoreError("files_mode", f"{what} is not kept: records are files",
+                         "their history is the repository's; read it with git")
 
     def revisions(self, *_a: Any, **_k: Any) -> list:
         self._refuse("a record's history")
@@ -2092,53 +841,654 @@ class FileRecords(Records):
         return []
 
 
-def records_mode(envelope: Path | str) -> tuple[str, str]:
-    """Where this project keeps its configuration, and what said so.
+class StoreRecords(FileRecords):
+    """A project in store mode: its connections, its grants, its default
+    pointer, its identifiers and its policy are read from and written to the
+    contract's tables in the project's store, and every other record stays in
+    the files `FileRecords` reads. A project that moved only its connections
+    and grants (`held="connections"`) keeps its identifiers and policy in
+    files. The two homes never compose: what the store holds is not read from
+    the files at all.
 
-    This is the only place the choice is read. Everything downstream takes an
-    adapter and cannot tell which it got, because a call site that can tell is
-    a call site that will eventually decide for itself."""
-    override = os.environ.get("CAPABILITIES_STORE_MODE")
-    if override:
-        if override not in ("files", "db"):
-            raise StoreError("bad_store_mode",
-                             f"CAPABILITIES_STORE_MODE must be files or db, got {override!r}")
-        return (override, "CAPABILITIES_STORE_MODE")
-    identity_file = Path(envelope) / "project.json"
+    A connection row belongs to no project, so it resolves as an identity the
+    project did not declare itself would: withheld until this project's grant
+    enables it. This project's grants are the rows whose `agent_id` is its id,
+    the row naming this node read before the row for every node, field by
+    field. A row never holds a secret value: `spec` names each secret by its
+    `*_env` key, which resolves on each node through that node's own cascade.
+
+    An identifier or a policy row whose `agent_id` is null is global: it
+    applies to every project reading this store, beneath the project's own
+    row. Identifiers resolve label by label, the project's row over the global
+    one. Policy resolves per capability, from the first of: the project's row
+    for this node, its row for every node, the global row for this node, the
+    global row for every node; none is default deny. A policy record carries
+    `node`, the node the row that answered names (None for every node), and
+    `set`/`delete` of a policy row take `node` to write or remove the row for
+    one node.
+
+    The store is reached through the shared database library, on first use
+    only, so a call that reads nothing the store holds never connects."""
+
+    def __init__(self, envelope: Path, global_dir: Path,
+                 project_id: str | None = None, project: str | None = None,
+                 include_global: bool = True, project_root: Path | None = None,
+                 application_name: str = STORE_OWNER, connection: Any = None,
+                 schema: str | None = None, held: str = RECORDS_MODE_KEY):
+        super().__init__(envelope, global_dir, project_id, project, include_global)
+        if held not in STORE_COLLECTIONS:
+            raise StoreError("bad_records_mode",
+                             f"a store holds {', '.join(sorted(STORE_COLLECTIONS))}, "
+                             f"not {held!r}")
+        self.held = held
+        self.collections = STORE_COLLECTIONS[held]
+        self.project_root = (Path(project_root) if project_root is not None
+                             else self.envelope.parent)
+        self.application_name = application_name
+        self.node = node_name()
+        self._conn = connection
+        self._owns_conn = connection is None
+        self._schema = schema
+        self._failure: StoreError | None = None
+        self._failed_at = 0.0
+        self._cache: dict[tuple[str, str], tuple[float, Any]] = {}
+
+    def _held(self, collection: str, key: str | None = None) -> bool:
+        return (collection in self.collections
+                or (collection == "setting" and key == "connection.default"))
+
+    def mode_of(self, collection: str, key: str | None = None) -> str:
+        return "store" if self._held(collection, key) else "files"
+
+    def close(self) -> None:
+        if self._owns_conn and self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+
+    # -- reaching the store ----------------------------------------------------
+
+    def _fail(self, error: StoreError) -> StoreError:
+        self._failure, self._failed_at = error, time.monotonic()
+        return error
+
+    def _unreachable(self, exc: Exception) -> StoreError:
+        """A connection that broke is dropped, so the next use opens a new one."""
+        if self._owns_conn and self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+        return self._fail(StoreError(
+            "store_unreachable", f"cannot reach the store: {exc}",
+            "check the database setting with `capabilities store doctor`"))
+
+    def _fresh(self, key: tuple[str, str]) -> Any:
+        held = self._cache.get(key)
+        if held is not None and time.monotonic() - held[0] < STORE_READ_SECONDS:
+            return held[1]
+        return None
+
+    def _db(self) -> Any:
+        """The connection, opened on first use. A refusal to connect stands for
+        STORE_READ_SECONDS, so one command does not wait on it twice."""
+        if self._failure is not None:
+            if time.monotonic() - self._failed_at < STORE_READ_SECONDS:
+                raise self._failure
+            self._failure = None
+        if self._conn is not None:
+            return self._conn
+        try:
+            from capabilities_contract import db
+        except ImportError:
+            raise self._fail(StoreError(
+                "driver_missing",
+                "the shared database library capabilities-contract is not installed",
+                "run the capability through its own script header, which pins it")) from None
+        try:
+            setting = db.resolve_setting(self.project_root)
+            self._conn = db.connect(application_name=self.application_name,
+                                    setting=setting)
+        except db.DbError as exc:
+            raise self._fail(StoreError(exc.slug, exc.message, exc.hint)) from None
+        self._schema = setting.schema
+        return self._conn
+
+    def _read(self, query: str, params: Sequence[Any]) -> list[tuple]:
+        conn = self._db()
+        import psycopg
+        try:
+            rows = conn.execute(query, params).fetchall()
+        except psycopg.errors.UndefinedTable:
+            # A store nothing was ever imported into holds no connection.
+            if self._owns_conn:
+                conn.rollback()
+            return []
+        except psycopg.OperationalError as exc:
+            raise self._unreachable(exc) from None
+        except psycopg.Error as exc:
+            if self._owns_conn:
+                conn.rollback()
+            raise StoreError("store_read_failed",
+                             f"reading records from the store failed: {exc}") from None
+        if self._owns_conn:
+            conn.rollback()
+        return rows
+
+    def _write(self, work: Any) -> Any:
+        """Run `work(conn)` in one transaction, the tables migrated first. A
+        connection handed in belongs to a caller holding its own transaction,
+        which this neither migrates nor commits."""
+        conn = self._db()
+        import psycopg
+        from capabilities_contract import db
+        try:
+            try:
+                if not self._owns_conn:
+                    return work(conn)
+                major, minor = STORE_TABLES_VERSION
+                db.migrate(conn, STORE_OWNER, record_table_steps(),
+                           major=major, minor=minor)
+                with conn.transaction():
+                    return work(conn)
+            except db.DbError as exc:
+                raise StoreError(exc.slug, exc.message, exc.hint) from None
+            except psycopg.OperationalError as exc:
+                raise self._unreachable(exc) from None
+            except psycopg.Error as exc:
+                raise StoreError("store_write_failed",
+                                 f"writing records to the store failed: {exc}") from None
+        finally:
+            self._cache.clear()
+
+    def _table_source(self, collection: str) -> str:
+        self._db()
+        return f"store:{self._schema}.{STORE_TABLES.get(collection, STORE_CONNECTIONS_TABLE)}"
+
+    # -- reading ---------------------------------------------------------------
+
+    def _connection_rows(self, capability: str) -> dict[str, dict[str, Any]]:
+        key = ("connection", capability)
+        held = self._fresh(key)
+        if held is None:
+            rows = self._read(
+                "SELECT name, spec FROM capabilities_connections "
+                "WHERE capability = %s ORDER BY name", (capability,))
+            held = {name: spec if isinstance(spec, dict) else {} for name, spec in rows}
+            self._cache[key] = (time.monotonic(), held)
+        return held
+
+    def _grant_rows(self, capability: str) -> dict[str, list[dict[str, Any]]]:
+        """This project's grants on this node, per connection: the row naming
+        this node first, then the row for every node."""
+        key = ("grant", capability)
+        held = self._fresh(key)
+        if held is None:
+            out: dict[str, list[dict[str, Any]]] = {}
+            if self.project_id:
+                rows = self._read(
+                    "SELECT connection, node, enabled, allow_write, is_default "
+                    "FROM capabilities_connection_grants "
+                    "WHERE agent_id = %s AND capability = %s "
+                    "AND (node IS NULL OR node = %s) "
+                    "ORDER BY connection, node NULLS LAST",
+                    (self.project_id, capability, self.node))
+                for cid, node, enabled, allow_write, is_default in rows:
+                    out.setdefault(cid, []).append({
+                        "node": node, "enabled": enabled,
+                        "allow_write": allow_write, "is_default": bool(is_default)})
+            self._cache[key] = (time.monotonic(), out)
+            held = out
+        return held
+
+    def _store_default(self, capability: str) -> str | None:
+        """The default pointer: this node's, else the one for every node."""
+        grants = self._grant_rows(capability)
+        for node in (self.node, None):
+            for cid in sorted(grants):
+                if any(r["is_default"] and r["node"] == node for r in grants[cid]):
+                    return cid
+        return None
+
+    def _identifier_rows(self, capability: str) -> dict[str, dict[str, tuple]]:
+        """This capability's identifiers in the store, per scope: this
+        project's rows and the global ones, each label to its value, note and
+        time of writing."""
+        key = ("identifier", capability)
+        held = self._fresh(key)
+        if held is None:
+            held = {"project": {}, "global": {}}
+            rows = self._read(
+                "SELECT agent_id, label, value, note, updated_at "
+                "FROM capabilities_identifiers "
+                "WHERE capability = %s AND (agent_id IS NULL OR agent_id = %s) "
+                "ORDER BY label", (capability, self.project_id))
+            for agent_id, label, value, note, updated_at in rows:
+                scope = "global" if agent_id is None else "project"
+                held[scope][label] = (value, note or "", _stamp(updated_at))
+            self._cache[key] = (time.monotonic(), held)
+        return held
+
+    def _policy_rows(self) -> list[tuple[str, str | None, dict[str, tuple]]]:
+        """The policy rows that apply to this project on this node, as the
+        layers they resolve in, highest first: (scope, node, rows by name)."""
+        key = ("policy", "")
+        held = self._fresh(key)
+        if held is None:
+            found: dict[tuple[str, str | None], dict[str, tuple]] = {}
+            rows = self._read(
+                "SELECT agent_id, capability, node, enabled, updated_at "
+                "FROM capabilities_policy "
+                "WHERE (agent_id IS NULL OR agent_id = %s) "
+                "AND (node IS NULL OR node = %s) ORDER BY capability",
+                (self.project_id, self.node))
+            for agent_id, name, node, enabled, updated_at in rows:
+                scope = "global" if agent_id is None else "project"
+                found.setdefault((scope, node), {})[name] = (
+                    {"enabled": bool(enabled)}, _stamp(updated_at))
+            held = [(scope, node, found.get((scope, node), {}))
+                    for scope in ("project", "global") for node in (self.node, None)]
+            self._cache[key] = (time.monotonic(), held)
+        return held
+
+    def _record(self, scope: str, capability: str, collection: str, key: str,
+                value: Any, ref: str, note: str | None = None,
+                updated_at: str | None = None, node: str | None = None) -> dict[str, Any]:
+        record = {"id": f"store:{capability}/{collection}/{ref}", "scope": scope,
+                  "project_id": self.project_id if scope == "project" else None,
+                  "capability": capability, "collection": collection, "key": key,
+                  "value": value, "note": note, "updated_at": updated_at,
+                  "updated_by": None}
+        if collection == "policy":
+            # Which node the row that answered names: this node's name, or None
+            # for the row for every node.
+            record["node"] = node
+        return record
+
+    def _scope_layers(self, capability: str, collection: str,
+                      scope: str) -> list[dict[str, dict[str, Any]]]:
+        """One scope's identifier or policy layers in the store, highest first:
+        for policy, the row for this node before the row for every node."""
+        if collection == "identifier":
+            rows = self._identifier_rows(capability)[scope]
+            return [{label: self._record(scope, capability, collection, label, value,
+                                         f"{scope}/{label}", note=note,
+                                         updated_at=updated_at)
+                     for label, (value, note, updated_at) in rows.items()}]
+        return [{name: self._record(scope, capability, collection, name, value,
+                                    f"{scope}/{name}@{node or '*'}",
+                                    updated_at=updated_at, node=node)
+                 for name, (value, updated_at) in rows.items()}
+                for at, node, rows in self._policy_rows() if at == scope]
+
+    def _entries(self, root: Path, capability: str, collection: str) -> dict[str, Any]:
+        if collection in self.collections:
+            return {}
+        entries = super()._entries(root, capability, collection)
+        if collection == "setting":
+            entries.pop("connection.default", None)
+        return entries
+
+    def config_layers(self, capability: str, collection: str,
+                      _scopes: Any = None) -> list[dict[str, dict[str, Any]]]:
+        _store_check("capability", capability, CAPABILITY_RE)
+        if collection == "connection":
+            rows = self._connection_rows(capability)
+            return [{name: self._record("store", capability, collection, name, spec, name)
+                     for name, spec in rows.items()}] if rows else []
+        if collection == "grant":
+            layers: list[dict[str, dict[str, Any]]] = []
+            for node in (self.node, None):
+                layer = {}
+                for cid, rows in self._grant_rows(capability).items():
+                    for row in rows:
+                        if row["node"] == node:
+                            value = {f: row[f] for f in GRANT_FIELDS if row[f] is not None}
+                            layer[cid] = self._record("project", capability, collection,
+                                                      cid, value, f"{cid}@{node or '*'}")
+                if layer:
+                    layers.append(layer)
+            return layers
+        if collection in self.collections:
+            scopes = ("project", "global") if self.include_global else ("project",)
+            return [layer for scope in scopes
+                    for layer in self._scope_layers(capability, collection, scope)
+                    if layer]
+        layers = super().config_layers(capability, collection)
+        if collection == "setting":
+            default = self._store_default(capability)
+            if default is not None:
+                layers.insert(0, {"connection.default": self._record(
+                    "project", capability, collection, "connection.default", default,
+                    "connection.default")})
+        return layers
+
+    def resolve_scope(self, capability: str, collection: str,
+                      scope: str) -> dict[str, dict[str, Any]]:
+        if collection in ("connection", "grant") and scope in ("project", "store"):
+            return self.resolve(capability, collection)
+        if collection in self.collections and collection in ("identifier", "policy"):
+            _store_check("capability", capability, CAPABILITY_RE)
+            self._scope_root(scope)
+            out: dict[str, dict[str, Any]] = {}
+            for layer in self._scope_layers(capability, collection, scope):
+                for key, row in layer.items():
+                    out.setdefault(key, row)
+            return out
+        return super().resolve_scope(capability, collection, scope)
+
+    def get(self, capability: str, collection: str, key: str) -> Any:
+        """A grant answers with the row that applies on this node, and says
+        which node it names (null for every node) and whether it is the
+        default pointer."""
+        if collection == "grant":
+            _store_check("capability", capability, CAPABILITY_RE)
+            rows = self._grant_rows(capability).get(key)
+            if not rows:
+                return None
+            row = rows[0]
+            out = {f: row[f] for f in GRANT_FIELDS if row[f] is not None}
+            out.update(node=row["node"], is_default=row["is_default"])
+            return out
+        return super().get(capability, collection, key)
+
+    def collection_source(self, capability: str, collection: str) -> str:
+        if collection in self.collections:
+            return self._table_source(collection)
+        return super().collection_source(capability, collection)
+
+    def scope_source(self, capability: str, collection: str, scope: str) -> str:
+        if collection in self.collections:
+            return self._table_source(collection)
+        return super().scope_source(capability, collection, scope)
+
+    # -- writing ---------------------------------------------------------------
+
+    def _grant_value(self, cid: str, value: Any) -> tuple[dict[str, Any], str | None]:
+        if not isinstance(value, dict):
+            raise StoreError("bad_grant",
+                             f"grant {cid!r} must be a table, got {type(value).__name__}")
+        known = (*GRANT_FIELDS, "node", "is_default")
+        unknown = set(value) - set(known)
+        if unknown:
+            raise StoreError("bad_grant",
+                             f"grant {cid!r} has unknown field(s): {', '.join(sorted(unknown))}",
+                             f"known: {', '.join(known)}")
+        for field in (*GRANT_FIELDS, "is_default"):
+            if field in value and not isinstance(value[field], bool) \
+                    and not (field in GRANT_FIELDS and value[field] is None):
+                raise StoreError("bad_grant", f"grant {cid!r} {field} must be true or false")
+        node = value.get("node")
+        if node is not None and (not isinstance(node, str) or not node.strip()):
+            raise StoreError("bad_grant",
+                             f"grant {cid!r} node must name a node, or be null for every node")
+        return {f: value[f] for f in (*GRANT_FIELDS, "is_default") if f in value}, node
+
+    def _put_grant(self, conn: Any, capability: str, cid: str,
+                   fields: dict[str, Any], node: str | None) -> None:
+        if not self.project_id:
+            raise StoreError("no_project_id",
+                             "this project has no id a grant could name",
+                             "run `capabilities init` in the project")
+        known = conn.execute(
+            "SELECT 1 FROM capabilities_connections WHERE capability = %s AND name = %s",
+            (capability, cid)).fetchone()
+        if known is None:
+            raise StoreError("unknown_connection",
+                             f"the store holds no {capability} connection {cid!r}",
+                             f"declare it first: `capabilities set {capability} "
+                             f"connection {cid} '{{...}}'`")
+        if fields.get("is_default"):
+            conn.execute(
+                "UPDATE capabilities_connection_grants SET is_default = false "
+                "WHERE agent_id = %s AND capability = %s AND connection <> %s "
+                "AND coalesce(node, '') = coalesce(%s, '') AND is_default",
+                (self.project_id, capability, cid, node))
+        columns = ["agent_id", "capability", "connection", "node", *fields]
+        values = [self.project_id, capability, cid, node, *fields.values()]
+        updates = ", ".join(f"{field} = EXCLUDED.{field}" for field in fields)
+        conn.execute(
+            f"INSERT INTO capabilities_connection_grants ({', '.join(columns)}) "
+            f"VALUES ({', '.join(['%s'] * len(values))}) "
+            "ON CONFLICT (agent_id, capability, connection, (coalesce(node, ''))) "
+            + (f"DO UPDATE SET {updates}" if updates else "DO NOTHING"),
+            values)
+
+    def _put_default(self, conn: Any, capability: str, cid: str | None,
+                     node: str | None) -> None:
+        if not self.project_id:
+            raise StoreError("no_project_id",
+                             "this project has no id a grant could name",
+                             "run `capabilities init` in the project")
+        conn.execute(
+            "UPDATE capabilities_connection_grants SET is_default = false "
+            "WHERE agent_id = %s AND capability = %s "
+            "AND coalesce(node, '') = coalesce(%s, '') AND is_default",
+            (self.project_id, capability, node))
+        if cid is not None:
+            self._put_grant(conn, capability, cid, {"is_default": True}, node)
+
+    def _scoped(self, collection: str, key: str | None, scope: str | None) -> bool:
+        """Whether a write at `scope` lands in the store. Identifiers and
+        policy keep both scopes there; a global connection, grant or default
+        pointer stays the config home's."""
+        if not self._held(collection, key):
+            return False
+        return scope != "global" or collection in ("identifier", "policy")
+
+    def _agent(self, scope: str | None) -> str | None:
+        """The `agent_id` a row at `scope` carries: this project's id, or null
+        for a global row."""
+        if scope not in (None, "project", "global"):
+            raise StoreError("bad_scope",
+                             f"scope {scope!r} must be one of {', '.join(SCOPE_KINDS)}")
+        if scope == "global":
+            return None
+        if not self.project_id:
+            raise StoreError("no_project_id",
+                             "this project has no id a store row could name",
+                             "run `capabilities init` in the project")
+        return self.project_id
+
+    def _put_identifier(self, capability: str, label: str, value: Any,
+                        note: str | None, scope: str | None) -> None:
+        agent = self._agent(scope)
+        self._write(lambda conn: conn.execute(
+            "INSERT INTO capabilities_identifiers "
+            "(agent_id, capability, label, value, note) "
+            "VALUES (%s, %s, %s, %s::jsonb, %s) "
+            "ON CONFLICT ((coalesce(agent_id, '')), capability, label) "
+            "DO UPDATE SET value = EXCLUDED.value, note = EXCLUDED.note, "
+            "updated_at = now()",
+            (agent, capability, label, json.dumps(value, ensure_ascii=False),
+             note or "")))
+
+    def _put_policy(self, name: str, value: Any, scope: str | None,
+                    node: str | None = None) -> None:
+        if (not isinstance(value, dict) or set(value) != {"enabled"}
+                or not isinstance(value["enabled"], bool)):
+            raise StoreError("bad_policy", f"policy for {name!r} must be "
+                             '{"enabled": true|false}')
+        agent = self._agent(scope)
+        node = _node_check(node)
+        self._write(lambda conn: conn.execute(
+            "INSERT INTO capabilities_policy (agent_id, capability, node, enabled) "
+            "VALUES (%s, %s, %s, %s) "
+            "ON CONFLICT ((coalesce(agent_id, '')), capability, (coalesce(node, ''))) "
+            "DO UPDATE SET enabled = EXCLUDED.enabled, updated_at = now()",
+            (agent, name, node, value["enabled"])))
+
+    def set(self, capability: str, collection: str, key: str, value: Any,
+            actor: str | None = None, note: str | None = None,
+            scope: str | None = None, node: str | None = None) -> None:
+        if not self._scoped(collection, key, scope):
+            return super().set(capability, collection, key, value,
+                               actor=actor, note=note, scope=scope, node=node)
+        _store_check("capability", capability, CAPABILITY_RE)
+        _store_check("key", key, KEY_RE)
+        _only_policy_names_a_node(collection, node)
+        _refuse_record_write(capability, collection)
+        if collection == "identifier":
+            return self._put_identifier(capability, key, value, note, scope)
+        if collection == "policy":
+            return self._put_policy(key, value, scope, node)
+        if scope not in (None, "project"):
+            raise StoreError("bad_scope",
+                             f"scope {scope!r} must be one of {', '.join(SCOPE_KINDS)}")
+        if collection == "connection":
+            if not isinstance(value, dict):
+                raise StoreError("bad_connection",
+                                 f"connection {key!r} must be a table, got "
+                                 f"{type(value).__name__}")
+            spec = {k: v for k, v in value.items() if k not in GRANT_FIELDS}
+            grant = {k: value[k] for k in GRANT_FIELDS if k in value}
+
+            def work(conn: Any) -> None:
+                conn.execute(
+                    "INSERT INTO capabilities_connections (capability, name, spec) "
+                    "VALUES (%s, %s, %s::jsonb) ON CONFLICT (capability, name) "
+                    "DO UPDATE SET spec = EXCLUDED.spec",
+                    (capability, key, json.dumps(spec, ensure_ascii=False)))
+                if grant:
+                    fields, node = self._grant_value(key, grant)
+                    self._put_grant(conn, capability, key, fields, node)
+            self._write(work)
+        elif collection == "grant":
+            fields, node = self._grant_value(key, value)
+            self._write(lambda conn: self._put_grant(conn, capability, key, fields, node))
+        else:
+            cid = value if isinstance(value, str) and value else None
+            if value not in (None, "") and cid is None:
+                raise StoreError("bad_default", "the default pointer names a connection id")
+            self._write(lambda conn: self._put_default(conn, capability, cid, None))
+
+    def delete(self, capability: str, collection: str, key: str,
+               scope: str | None = None, node: str | None = None) -> bool:
+        if not self._scoped(collection, key, scope):
+            return super().delete(capability, collection, key, scope=scope, node=node)
+        _only_policy_names_a_node(collection, node)
+        _refuse_record_write(capability, collection)
+        if collection == "identifier":
+            agent = self._agent(scope)
+
+            def work(conn: Any) -> bool:
+                return conn.execute(
+                    "DELETE FROM capabilities_identifiers "
+                    "WHERE coalesce(agent_id, '') = coalesce(%s, '') "
+                    "AND capability = %s AND label = %s",
+                    (agent, capability, key)).rowcount > 0
+        elif collection == "policy":
+            agent = self._agent(scope)
+            node = _node_check(node)
+
+            def work(conn: Any) -> bool:
+                return conn.execute(
+                    "DELETE FROM capabilities_policy "
+                    "WHERE coalesce(agent_id, '') = coalesce(%s, '') "
+                    "AND capability = %s AND coalesce(node, '') = coalesce(%s, '')",
+                    (agent, key, node)).rowcount > 0
+        elif collection == "connection":
+            def work(conn: Any) -> bool:
+                return conn.execute(
+                    "DELETE FROM capabilities_connections "
+                    "WHERE capability = %s AND name = %s", (capability, key)).rowcount > 0
+        elif collection == "grant":
+            def work(conn: Any) -> bool:
+                return conn.execute(
+                    "DELETE FROM capabilities_connection_grants WHERE agent_id = %s "
+                    "AND capability = %s AND connection = %s AND node IS NULL",
+                    (self.project_id, capability, key)).rowcount > 0
+        else:
+            def work(conn: Any) -> bool:
+                return conn.execute(
+                    "UPDATE capabilities_connection_grants SET is_default = false "
+                    "WHERE agent_id = %s AND capability = %s AND node IS NULL "
+                    "AND is_default", (self.project_id, capability)).rowcount > 0
+        return bool(self._write(work))
+
+
+def _only_policy_names_a_node(collection: str, node: Any) -> None:
+    """A grant names its node inside its value; a policy row is the one record
+    written for a node through `node`."""
+    if node is not None and collection != "policy":
+        raise StoreError("bad_node", f"a {collection} record is not written for a "
+                         "node this way; only a policy row is")
+
+
+def _stamp(moment: Any) -> str | None:
+    """A row's time of writing as the text a report carries."""
+    return moment.isoformat() if hasattr(moment, "isoformat") else moment
+
+
+def _identity_record(envelope: Path) -> dict[str, Any]:
     try:
-        identity = json.loads(identity_file.read_text())
+        identity = json.loads((Path(envelope) / "project.json").read_text())
     except (OSError, ValueError):
-        return ("files", "no project identity")
-    mode = identity.get("store", "files")
-    if mode not in ("files", "db"):
-        raise StoreError("bad_store_mode", f"{identity_file} declares store {mode!r}",
-                         'expected "files" or "db"')
-    return (mode, str(identity_file))
+        return {}
+    return identity if isinstance(identity, dict) else {}
+
+
+def records_mode(envelope: Path | str) -> str:
+    """Where this project keeps its records: `files`, unless its
+    `project.json` says `"records": "store"`. Only that record decides it."""
+    identity_file = Path(envelope) / "project.json"
+    declared = _identity_record(Path(envelope)).get(RECORDS_MODE_KEY, "files")
+    if declared not in RECORDS_MODES:
+        raise StoreError("bad_records_mode",
+                         f"{identity_file} declares records {declared!r}",
+                         f"one of: {', '.join(RECORDS_MODES)}; the manager writes it")
+    return declared
+
+
+def connections_mode(envelope: Path | str) -> str:
+    """Where this project keeps its connections and grants: `store` when its
+    records are in the store or its `project.json` says `"connections":
+    "store"`, `files` otherwise. Only that record decides it."""
+    if records_mode(envelope) == "store":
+        return "store"
+    identity_file = Path(envelope) / "project.json"
+    declared = _identity_record(Path(envelope)).get(CONNECTIONS_MODE_KEY, "files")
+    if declared not in CONNECTIONS_MODES:
+        raise StoreError("bad_connections_mode",
+                         f"{identity_file} declares connections {declared!r}",
+                         f"one of: {', '.join(CONNECTIONS_MODES)}; the manager writes it")
+    return declared
 
 
 def open_records(envelope: Path | str, global_dir: Path | str,
-                 url: str | None = None, project_only: bool = False) -> Records:
-    """The adapter this project's configuration is read and written through."""
+                 project_only: bool = False, project_root: Path | str | None = None,
+                 project_id: str | None = None,
+                 application_name: str = STORE_OWNER) -> Records:
+    """The adapter this project's configuration is read and written through:
+    the project's envelope, then `global_dir` unless `project_only`; in store
+    mode a project's connections, grants, identifiers and policy come from its
+    store instead (only its connections and grants where it moved only those),
+    for the project id given (else project.json's), its database resolved for
+    `project_root` (else the envelope's parent).
+
+    A `project.json` that declares a `store` other than `files` is refused
+    rather than read as files, since the records it points at are not where it
+    says."""
     envelope, global_dir = Path(envelope), Path(global_dir)
-    mode, source = records_mode(envelope)
-    identity = {}
-    try:
-        identity = json.loads((envelope / "project.json").read_text())
-    except (OSError, ValueError):
-        pass
-    slug, project_id = identity.get("slug"), identity.get("id")
-    if mode == "files":
-        adapter = FileRecords(envelope, global_dir, project_id, slug,
-                              include_global=not project_only)
-        adapter.source = source if source == "CAPABILITIES_STORE_MODE" else str(envelope)
-        return adapter
-    if not slug:
-        raise StoreError("no_project_identity",
-                         f"{envelope / 'project.json'} keeps this project's records "
-                         "in the store but declares no slug to read them under",
-                         "run `capabilities init` in the project")
-    store = open_store(url)
-    return StoreRecords(store, Scopes(project=slug, include_global=not project_only),
-                        ("project", slug))
+    identity_file = envelope / "project.json"
+    identity = _identity_record(envelope)
+    declared = identity.get("store", "files")
+    if declared != "files":
+        raise StoreError("bad_store_mode",
+                         f"{identity_file} declares store {declared!r}; records are "
+                         "kept only in files",
+                         'remove "store" from project.json, or set it to "files"')
+    if connections_mode(envelope) == "store":
+        held = (RECORDS_MODE_KEY if records_mode(envelope) == "store"
+                else CONNECTIONS_MODE_KEY)
+        return StoreRecords(envelope, global_dir, project_id or identity.get("id"),
+                            identity.get("slug"), include_global=not project_only,
+                            project_root=Path(project_root) if project_root else None,
+                            application_name=application_name, held=held)
+    return FileRecords(envelope, global_dir, identity.get("id"), identity.get("slug"),
+                       include_global=not project_only)
 
 # <<< contract: store <<<
