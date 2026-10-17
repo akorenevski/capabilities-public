@@ -28,13 +28,17 @@ Every script implements the same contract verbs alongside its domain verbs. This
 |---|---|
 | `help` | The full usage contract (the module docstring), verbatim. |
 | `doctor` | The cheapest authenticated round-trip, per connection; proves credentials, reachability, identity. |
-| `connections` | The resolution report: every connection, every value, its winning tier and source, secrets masked. Local only — no network. |
+| `connections` | The resolution report: every connection, every value, its winning tier and source, secrets masked. Local only — no call to any system a connection names; in store mode reading the store is the resolution. |
 | `stub` | The one-line awareness text. |
 | `manifest --json` | The machine-readable declaration (schema below). |
 | `guide` / `guide <topic>` | The shipped guide menu with previews / one guide's body, fetched live from the docs base. |
 | `ids list\|get\|set\|rm` | The project identifiers envelope, managed. |
 | `refs` | The menu of the project's reference files, from front-matter. |
 | `inventory` | What the capability holds in this project: headline metrics and the things inside. Local only by default — no network, no writes. |
+| `connection add\|remove` | Only for a capability that declares `CONN_FIELDS`: write or remove one connection from its declared fields, its secrets from stdin (see [what a person is asked for](#what-a-person-is-asked-for)). |
+| `setup` | Only for a capability that declares `SETUP_FIELDS`: report, write or remove the machine's prerequisites. |
+| `settings` | Only for a capability that declares `SETTINGS`: read every settings document whole, and write one key or one document, wherever it lives. |
+| `migrate` / `migrate status` | Only for a capability that declares `TABLES`: apply its pending migration steps to its tables in the project's database / report where they stand, without a lock, changing nothing (see [runtime state in the store](#runtime-state-in-the-store)). |
 
 The declaration facts feed the contract from **constants at the top of the script** — one home each. Guide topics are the exception: their one home is the set of shipped Markdown filenames. Contract verbs render from these sources so they cannot disagree with one another:
 
@@ -49,9 +53,18 @@ WRITE_VERBS = {"create", "comment", "complete"}   # domain verbs that mutate the
 WRITE_DEFAULT = True    # a connection's allow_write when its entry is silent; False when writes leave the system
 DOCS_BASE = "https://raw.githubusercontent.com/<org>/capabilities/main/capabilities/asana/guides/"
 STATE = False       # True when the capability writes session/cache state
+TABLES = False      # True when it keeps tables in the project's database, with a _tables() builder
 INVENTORY = None    # or {"network": "none"|"optional"|"required"} with an _inventory(network) builder
 POST_INSTALL = []   # [{"cmd": …, "note": …}] steps the manager offers at install
 SERVICE = None      # or {"name", "summary", "verbs", ...} when a bundled service ships
+CONN_FIELDS = [     # a connection entry's own fields; turns on `connection add|remove`
+    {"key": "secret_env", "label": "Personal access token", "type": "string",
+     "secret": True, "required": True, "env": "ASANA_{ID}_TOKEN",
+     "help": "An Asana personal access token."},
+]
+SETUP_FIELDS = []   # the machine's prerequisites, set once; turns on `setup`
+LINK_METHODS = []   # interactive ceremonies that link a connection, each with --events
+SETTINGS = None     # or {"homes": [...], "keys": [...]}; turns on `settings`
 ```
 
 ## Agent-first help is the surface
@@ -103,6 +116,17 @@ The line is awareness, not a promise the tool is usable here — readiness is `d
   "state": false,
   "inventory": { "network": "optional" },
   "post_install": [],
+  "tables": false,
+  "connections": {
+    "fields": [
+      { "key": "secret_env", "label": "Personal access token", "type": "string",
+        "secret": true, "required": true, "env": "ASANA_{ID}_TOKEN",
+        "help": "An Asana personal access token." }
+    ],
+    "setup": [],
+    "link": []
+  },
+  "settings": null,
   "service": {
     "name": "assistant",
     "summary": "Project-local assistant daemon using the bundled service engine.",
@@ -136,6 +160,10 @@ The line is awareness, not a promise the tool is usable here — readiness is `d
 | `state` | `true` declares the capability writes session/cache state (see [state](#state)). |
 | `inventory` | `null` when the capability reports nothing of its own; otherwise `{ "network": "none" \| "optional" \| "required" }` — how much of its report needs the remote system (see [inventory](#inventory--what-the-capability-holds-here)). |
 | `post_install[]` | `{ "cmd", "note" }` steps the manager **offers** at install — idempotent, never auto-run. |
+| `tables` | `true` declares the capability keeps tables in the project's database and answers `migrate`; the manager runs `<name> migrate` where the payload arrives (see [runtime state in the store](#runtime-state-in-the-store)). |
+| `connections` | `null` for a capability without the connections tier; otherwise `{ "fields", "setup", "link" }` from `CONN_FIELDS` (`null` where it declares none), `SETUP_FIELDS` and `LINK_METHODS` ([what a person is asked for](#what-a-person-is-asked-for)). |
+| `settings` | `null` for a capability that keeps no settings; otherwise `{ "homes", "keys" }` from `SETTINGS` ([settings](#settings)). |
+| `contribution` *(optional)* | The capability's context contribution (DOCTRINE rule 2): `{ "path", "max_bytes" }`, and any other key is refused. `path` names a Markdown file relative to the capability's own folder in the project envelope and inside its `state/` folder — `state/context.md` — with no leading `/`, no backslash, and no empty, `.` or `..` segment. `max_bytes` is an integer from 1 to 32768, the most UTF-8 bytes the manager composes from that file. The capability keeps the file rendered and answers `<name> render`, which rewrites it. The manager reads that file and nothing else when it composes the project context, placing it directly after the stub line under the capability's own second-level heading, so the file opens no heading above the third level; an empty file adds nothing, and a missing, unreadable, malformed or oversized one is replaced by a single line pointing to `<name> render`. The manager validates the declaration during audit, source check, and install. |
 | `service` *(optional)* | Metadata for a bundled service: at minimum `name`, `summary`, and `verbs[]`. The CLI owns its lifecycle contract under `<name> service ...`. |
 | `service.deploy` *(optional)* | Versioned, provider-neutral deploy descriptor. Its v1 contract declares an argv `command`, service-only `environment.required[]` and optional `{key, default?}` entries, named `state`/`shared` mounts, Compose restart policy, optional doctor argv, and `default_policy` (`auto` or `disabled`). Mount targets are absolute or start with `{agent_home}` / `{project_root}` and are resolved by the consuming runtime. Generic CLI credentials do not become service requirements unless the descriptor declares them. |
 | `service.machine` *(optional)* | Declares that the service also runs once per machine for every project that opted in to it (see [machine mode](#machine-mode)). Its v1 contract (`capabilities.service.machine.v1`) names the argv `command` that runs it in the foreground and the argv `doctor` that proves it, each starting with the capability's name and carrying `--machine`; `projects`, the file under the capability's own config home where it lists the projects that opted in; and optionally `config` and `state`, the machine homes of its settings and its runtime files. Any other key is refused. A capability declaring it lists `join` and `leave` among its service verbs. The manager validates it during audit, source check, and install. |
@@ -144,8 +172,7 @@ The line is awareness, not a promise the tool is usable here — readiness is `d
 when the deployment runtime's `service_policy.auto_include` is true. `disabled`
 requires that runtime to name the capability with an `enabled` override. Neither
 value authorizes a service: explicit project capability enablement remains the
-outer gate. The manager validates v1 descriptors during audit, source check, and
-install; capabilities without `service` or without `service.deploy` remain valid.
+outer gate. That holds for a project whose gate is in files; a project whose records are in the store compiles every installed descriptor whatever its `default_policy`, and its service runs on a node only where the project's policy row names that node (`deployment guide profiles`). The manager validates v1 descriptors during audit, source check, and install; capabilities without `service` or without `service.deploy` remain valid.
 
 ## Guides
 
@@ -198,12 +225,12 @@ The cache is the **offline floor, never the authority**: `$XDG_STATE_HOME/<name>
       "detail": "0 3 * * *",
       "attributes": [{ "label": "environment", "value": "production" }] }
   ],
-  "service": { "state": "running", "detail": "pid 4211" },
+  "service": { "state": "running", "detail": "pid 4211", "ok": true },
   "deferred": []
 }
 ```
 
-Every field is present on every answer, so a consumer never branches on absence. `capability` and `project` say who answered and about where (`project` is `null` outside a project). `metrics[]` are the headline figures, each `{ "label", "value", "note"? }`, rendered in the order given. `items[]` are the things inside, each `{ "name", "group"?, "state"?, "detail"?, "attributes"? }` — `group` sorts an answer that carries more than one kind of thing (scripts and schedules), `state` is one word a reader shows as a chip, `detail` is one line beside the name, and `attributes[]` are further `{ "label", "value" }` pairs. Ordered arrays rather than objects throughout: a reader that decodes JSON into a map loses the author's order, and the order is what makes the rendering legible. `service` is `null` unless the capability ships one, else `{ "state", "detail"? }` — and a capability that ships one always reports it, read from what the service left on this machine, so `capabilities inventory` can carry every declared service's state. `deferred[]` names what this run did not fetch, each `{ "label", "note"? }`.
+Every field is present on every answer, so a consumer never branches on absence. `capability` and `project` say who answered and about where (`project` is `null` outside a project). `metrics[]` are the headline figures, each `{ "label", "value", "note"? }`, rendered in the order given. `items[]` are the things inside, each `{ "name", "group"?, "state"?, "detail"?, "attributes"? }` — `group` sorts an answer that carries more than one kind of thing (scripts and schedules), `state` is one word a reader shows as a chip, `detail` is one line beside the name, and `attributes[]` are further `{ "label", "value" }` pairs. Ordered arrays rather than objects throughout: a reader that decodes JSON into a map loses the author's order, and the order is what makes the rendering legible. `service` is `null` unless the capability ships one, else `{ "state", "detail"?, "ok"?, "problem"? }` — and a capability that ships one always reports it, read from what the service left on this machine, so `capabilities inventory` can carry every declared service's state. `state` is `running` while a process serves the project, whether its own or the machine service it joined. `ok` is the verdict of the service's local checks — the part of its `service doctor` that reads this machine and nothing further: `true` when they find nothing wrong, `false` with a one-line `problem` naming what they found; a service that gives no verdict leaves `ok` out, and `capabilities inventory` reports it as `null`. A check that needs the network, the store, or a model turn stays `service doctor`'s alone, so a reader can colour every service without paying for any of them. `deferred[]` names what this run did not fetch, each `{ "label", "note"? }`.
 
 **The read is local, fast, secret-free, and leaves nothing changed.** No network, no login, no writes — not to the project, not to state, not to a cache. A secret never appears, masked or otherwise; where credentials resolve from is `connections`' question and whether they work is `doctor`'s.
 
@@ -223,28 +250,28 @@ The envelope, the flag parsing and the empty answer are vendored in the contract
 
 ## Project records and the envelope
 
-Every project has a visible `capabilities/` envelope. `capabilities/project.json` gives the project its slug, holds its durable id (resolved as described below), and selects where live configuration is kept with `"store": "files"` or `"store": "db"`; absence preserves files mode. The project identity is the bootstrap fact that selects the records adapter, and the policy gate then comes through that adapter with every other live record. `CAPABILITIES_STORE_MODE` is a diagnostic override, not project doctrine.
+Every project has a visible `capabilities/` envelope. `capabilities/project.json` gives the project its slug and holds its durable id (resolved as described below). Live configuration is kept in files, apart from the connections, grants, identifiers and policy a project in store mode keeps in its store ([connections in the store](#connections-in-the-store)) and the definitions a service runs from - its workers, its scheduled jobs - which the store keeps as versions (DOCTRINE rule 22), and the policy gate comes through the records adapter with every other live record.
 
-All runtime readers open the same records adapter. Files mode maps logical collections onto the established envelope and `$XDG_CONFIG_HOME` layout. Database mode reads the same collections from the configured store (local SQLite by default, selected by the manager's store URL resolution). Project records resolve before global records; merge collections compose by key, and a connection identity is always taken whole from one scope rather than assembled field by field. A call site asks for a collection and never branches on the backend.
+All runtime readers open the same records adapter, which maps logical collections onto the established envelope and `$XDG_CONFIG_HOME` layout. Project records resolve before global records; merge collections compose by key, and a connection identity is always taken whole from one scope rather than assembled field by field. A call site asks for a collection, never for a path.
 
-In files mode, project material has this layout:
+Project material has this layout:
 
 ```
 capabilities/
-  project.json        # durable project identity and files/db selection
-  settings.json       # policy records in files mode
+  project.json        # durable project identity
+  settings.json       # policy records (files mode)
   <name>/
-    connections.json  # connection, grant, and default-setting records
-    identifiers.json  # identifier records, managed by the ids verbs
-    reference/        # one front-matter .md per reference in files mode
+    connections.json  # connection, grant, and default-setting records (files mode)
+    identifiers.json  # identifier records, managed by the ids verbs (files mode)
+    reference/        # one front-matter .md per reference
       *.md
-    service/          # project-local service settings/context in files mode
+    service/          # project-local service settings/context
     state/            # capability-written; never committed
 ```
 
-In database mode those logical records and document bodies, including the policy gate, live in the store; the envelope still holds project identity, the state guard, and source-owned project material that is not a live record.
+Configuration - settings, references and state - stays in these files, and so do the gate, identifiers, connections and grants in files mode; a service's definitions - its workers, its scheduled jobs - are versions in the store. The database holds only the tables the package designs and migrates for itself: each capability's runtime state and the definitions its service runs from ([runtime state in the store](#runtime-state-in-the-store)) and, in store mode, the contract's record tables ([connections in the store](#connections-in-the-store)).
 
-**The machine's store setting is the one store pointer.** `capabilities store set` records it and is its only writer: the non-secret values — host, port, database, user, an `sslmode` of `require` or stronger, and an optional root certificate — in `$XDG_CONFIG_HOME/capabilities/store.json`, and the password in the manager's own credentials tier, `$XDG_CONFIG_HOME/capabilities/credentials.env`, at mode 0600, taken from stdin, a file or a named environment variable and never from argv. The manager's store URL resolution takes `CAPABILITIES_STORE_URL` when it is set, for tests and development sessions, else the setting, else the local default. A capability reads the setting from the manager's files through the store tier's `read_store_setting()`, which writes nothing. `capabilities store show` reports the setting without its secret, and `capabilities store doctor` proves that a TLS connection works and that a plain-text one is refused.
+**A project resolves its database through one cascade** - the project's env files, then the process environment, then the machine's store setting file - and its levels, keys and file are [the store setting](#the-store-setting).
 
 `capabilities/` is canonical and intentionally visible so the project's context
 owner and humans share one project body. The runtime also reads a legacy
@@ -285,7 +312,7 @@ reconstructible from nothing, so deleting it costs one resolution.
 
 **The project id is resolved beside the envelope.** In a project bound by `.contextkit/config.toml` the id belongs to ContextKit: `contextkit identity show --json --project <root>` answers it, a non-null `config` saying the project is bound and a non-null `id` being authoritative; a ContextKit that has no `identity` verb holds no id, which reads as a null one. There `project.json` holds at most a copy of that id: the manager fills a missing copy from ContextKit, never mints or rewrites one, and writes no `project.json` at all while ContextKit has no id, because `contextkit identity adopt` reads an absent file as no id yet and refuses one that carries none. Without the binding the id is `project.json`'s own, minted once by `capabilities init`. The answer is in one of four states: `unbound` (project.json's id), `pending` (bound, and ContextKit has no id yet, so an existing project.json id is used, which is the id `contextkit identity adopt` takes), `adopted` (ContextKit's id) and `mismatch` (project.json holds a different id, and ContextKit's is used). A write that stamps the id, such as a record a capability attributes to the project or a store registration, takes it only when it is verified for that invocation and otherwise exits 6: a mismatch names both ids, a bound project with no id anywhere names `contextkit identity adopt`, and a ContextKit that cannot answer is named as such. Reads never refuse over the id: they take it in every state, a ContextKit that cannot answer leaving them on project.json's id, and a read path that would register the project leaves the registration out where the id may not be stamped. The manager never runs `contextkit identity adopt`. `capabilities doctor` reports the state and fails on a mismatch, which is reconciled by hand. The manager records ContextKit's answer the way it records the envelope, one entry per root at `$XDG_CACHE_HOME/capabilities/identity/`, against the same inputs, the binding where ContextKit keeps the id and the program that answered, and never records a failed answer; `capabilities path --json --identity` answers on a miss. A capability reads that record through the contract and asks the manager when the record does not stand. An id a write may stamp is handed down beside the envelope, as `$CAPABILITIES_PROJECT_ID` scoped by `$CAPABILITIES_PROJECT_ID_ROOT` exactly as the envelope handoff is scoped, by every process that resolves the envelope, which resolves the id with it at read level, and by every process the manager launches into a project; in an unresolved, mismatched or id-less state nothing is handed down, and the child resolves on its own; a live handoff for the root outranks ContextKit, so a descendant uses it without asking again.
 
-- **Identifiers** — discoverable, non-secret, structural lookup (DOCTRINE rule 4). In files mode `identifiers.json` is a thin standard envelope — label → `{ value, note }`; in database mode the same entries are identifier records. Any reader renders the same menu without understanding the capability, and capability-specific structure lives inside values:
+- **Identifiers** — discoverable, non-secret, structural lookup (DOCTRINE rule 4). `identifiers.json` is a thin standard envelope — label → `{ value, note }`. Any reader renders the same menu without understanding the capability, and capability-specific structure lives inside values:
 
   ```json
   {
@@ -296,7 +323,7 @@ reconstructible from nothing, so deleting it costs one resolution.
 
   Connections vs identifiers is a **provenance split**: connection entries hold values someone *chose* (wiring, per-connection behavioural keys); identifiers hold values the CLI *discovered*. Different writer, different cadence, different git-diff meaning — never merged.
 
-- **References and service context** — prose by nature (a model, treatment, taxonomy, or prompt), exposed as versioned documents through `<name> context`. Files mode keeps them as `.md` under their established envelope paths; database mode keeps immutable bodies plus the active project/global pin. `<name> context edit <key>` yields an editable path and `<name> context put <key>` publishes it with an optimistic base-version check. `<name> refs` remains the compact reference menu and `<name> context show <key>` returns a body without exposing which backend answered.
+- **References and service context** — prose by nature (a model, treatment, taxonomy, or prompt), exposed as versioned documents through `<name> context`. They are kept as `.md` under their established envelope paths. `<name> context edit <key>` yields an editable path and `<name> context put <key>` publishes it with an optimistic base-version check. `<name> refs` remains the compact reference menu and `<name> context show <key>` returns a body.
 
   ```markdown
   ---
@@ -305,29 +332,71 @@ reconstructible from nothing, so deleting it costs one resolution.
   ---
   ```
 
-  `<name> refs` emits the menu — `[{ "name", "description", "path" }]` — reading front matter without loading unrelated bodies. In files mode `path` is the document path; in database mode it is the corresponding `<name> refs show <key>` command.
+  `<name> refs` emits the menu — `[{ "name", "description", "path" }]` — reading front matter without loading unrelated bodies. `path` is the document path.
 
 The `ids` verbs manage the identifier collection through the adapter:
 
 | Verb | Does |
 |---|---|
-| `ids list` | Prints the resolved small, non-secret lookup. Empty/absent → `{}`. |
+| `ids list` | Prints the resolved small, non-secret lookup, each label's `scope` naming where its value came from (`project` or `global`). Empty/absent → `{}`. |
 | `ids get <label>` | Prints the value as stored. Unknown label → exit 3. |
-| `ids set <label> <value> [--note <text>]` | Upsert: `<value>` parses as JSON, a non-JSON argument stores as a string; `--note` sets the annotation. |
-| `ids rm <label>` | Removes the label. Unknown label → exit 3. |
+| `ids set <label> <value> [--note <text>] [--global]` | Upsert: `<value>` parses as JSON, a non-JSON argument stores as a string; `--note` sets the annotation. |
+| `ids rm <label> [--global]` | Removes the label. Unknown label → exit 3. |
 
-`ids set` writes the project scope selected by `project.json`; in files mode it creates `capabilities/<name>/` on demand inside an existing envelope. In a project with no envelope it exits 6, naming `capabilities init` as the remediation.
+Identifiers resolve label by label, the project's value over the global one. `ids set` and `ids rm` act on the project scope, creating `capabilities/<name>/` on demand inside an existing envelope; in a project with no envelope they exit 6, naming `capabilities init` as the remediation. With `--global` they act on the global scope instead: `$XDG_CONFIG_HOME/<name>/identifiers.json` in files mode, and in store mode the global row, which every project reading that store resolves beneath its own.
+
+## The store setting
+
+Which database a process uses is resolved per project, through one cascade shared by every tool of the family that reaches a database - the capabilities, ContextKit and AgentKit - whether or not the others are installed. Three levels are asked in order, and the first that answers is used whole, never completed from a lower level:
+
+1. **Project** - the `AGENTKIT_DB_*` keys in the project's `.env.local` and `.env`, `.env.local` winning key by key.
+2. **Process environment** - the same keys in the environment of the process. On a server this is the source.
+3. **Machine** - the machine's store setting file, below. On a workstation this is usually the source.
+
+**Keys.** `AGENTKIT_DB_URL`, `AGENTKIT_DB_HOST`, `AGENTKIT_DB_PORT` (default 5432), `AGENTKIT_DB_NAME`, `AGENTKIT_DB_USER`, `AGENTKIT_DB_PASSWORD`, `AGENTKIT_DB_SCHEMA` (default `agentkit`), `AGENTKIT_DB_SSLMODE` (default `require`) and `AGENTKIT_DB_SSLROOTCERT`, the same in a project's env files and in the process environment. A level answers when it sets any of them. Within one level `AGENTKIT_DB_URL`, a `postgresql://` URL, wins and that level's separate fields are ignored; `AGENTKIT_DB_SCHEMA` still applies beside it.
+
+**One resolver.** The database is PostgreSQL. Each tool of the family resolves the cascade with its own code; inside this package that code is the shared database library alone ([runtime state in the store](#runtime-state-in-the-store)), and no second copy of the order exists. A status or doctor surface reports which level answered and the file or variable each value came from, its secrets redacted. With no level answering, a tool that needs the database refuses with `store_not_configured`.
+
+**The machine file.** `$XDG_CONFIG_HOME/agentkit/store.json` when `XDG_CONFIG_HOME` is set; `~/.config/agentkit/store.json` only when it is unset. A reader reports the absolute path it resolved, since a process started outside a shell, such as an app opened from the Finder or a launchd agent, does not see an `XDG_CONFIG_HOME` a shell profile exports.
+
+**Format, version 1.** One JSON object, at mode 0600, the password inside it:
+
+| Field | Required | Value |
+|---|---|---|
+| `schema` | yes | `"agentkit.store.v1"`, the format version |
+| `host` | yes | host name, address, or the directory of a Unix socket |
+| `port` | yes | integer 1-65535 |
+| `database` | yes | database name |
+| `user` | yes | role name |
+| `password` | no | the role's password; absent when the role needs none |
+| `sslmode` | yes | `require`, `verify-ca` or `verify-full`; `disable` only for a local host |
+| `sslrootcert` | no | a root certificate file path, or `system` |
+| `db_schema` | no | the schema inside the database that every tool binds to; `agentkit` when absent |
+
+`host`, `database` and `user` carry no whitespace. A version 1 file carries these fields and no others.
+
+**Where each tool's tables live.** Every tool keeps its tables inside the schema the resolved setting names - `db_schema` in the file, `AGENTKIT_DB_SCHEMA` at the levels above it - each under its own prefix, with its own migrations and ledger, and refers to another tool's rows by value only, never by a foreign key.
+
+**TLS.** A database reached across a network is reached over TLS: `sslmode` is `require` or stronger, at every level and in a URL. `disable` is allowed only when the host is a local host — `localhost`, a loopback address, or a Unix socket directory — and `allow` and `prefer` never.
+
+**Versions.** A reader refuses a version it does not know with a clear error rather than guessing at it. A writer never replaces or removes a file of a version it does not know, and writes the lowest version that expresses what it holds.
+
+**Writes.** Any tool of the family may write the machine file. A write replaces the whole file atomically — a temporary file in the same directory, renamed over it — at mode 0600. In this package the manager is the writer: `capabilities store set` and `capabilities store unset`, taking the password from stdin, a file or a named environment variable and never from argv; `capabilities store show` reports the setting and the path without its secret, and `capabilities store doctor` proves it. A project's env files and a server's environment are written by whoever configures that project or server, never by a tool.
+
+A capability resolves the setting, and reaches its runtime state, through the shared database library ([runtime state in the store](#runtime-state-in-the-store)).
 
 ## The capability policy gate
 
-Operational verbs and `doctor` pass an effective two-scope policy gate before dispatch. Safe discovery verbs — `help`, `stub`, `manifest`, and the local-only `connections` report — remain available so a disabled capability can be understood and configured. The manager owns the policy collection. Files mode maps it to:
+Operational verbs and `doctor` pass an effective two-scope policy gate before dispatch. Safe discovery verbs — `help`, `stub`, `manifest`, and the local-only `connections` report — remain available so a disabled capability can be understood and configured. The manager owns the policy collection, kept in files mode at:
 
 1. Project: `capabilities/settings.json`.
 2. Global machine default: `$XDG_CONFIG_HOME/capabilities/settings.json`.
 
-Database mode keeps both scopes as policy rows in the configured store. An explicit project entry wins. An absent project entry inherits the global entry. Absence at both scopes is disabled by default. Policy mutations require explicit `--project` or `--global`; the agent asks the user which scope they mean rather than guessing.
+In store mode it is kept in the store instead ([connections in the store](#connections-in-the-store)): the project's rows and the global rows that every project reading that store shares, a row naming the running node read before the row for every node at each scope.
 
-Above both scopes sits the machine ceiling, `$XDG_CONFIG_HOME/capabilities/machine.json`, which only the manager writes and which is never kept in a store, because it answers for this machine alone. Each installed capability is `allowed` or `quarantined` there; a capability without an entry is allowed. Quarantined is effective-disabled in every project and outside any, whatever the project or global entry says: `_gate()` refuses its operational verbs and `doctor` with exit 4 (`quarantined`) before it resolves a project or a policy row, a `--machine` call included, while safe discovery stays available. Allowed leaves the two scopes deciding exactly as below. `capabilities install` writes `quarantined` for a capability new to the machine and `allowed` when given `--allow`; reinstalling or updating keeps the state, and uninstalling drops it. `capabilities allow` and `capabilities quarantine` change it, and lifting a quarantine is the user's decision, never an agent's.
+An explicit project entry wins. An absent project entry inherits the global entry. Absence at both scopes is disabled by default. Policy mutations require explicit `--project` or `--global`; the agent asks the user which scope they mean rather than guessing.
+
+Above both scopes sits the machine ceiling, `$XDG_CONFIG_HOME/capabilities/machine.json`, which only the manager writes and which is never kept in a store, because it answers for this machine alone. Each installed capability is `allowed` or `quarantined` there; a capability without an entry is allowed. Quarantined is effective-disabled in every project and outside any, whatever the project or global entry says: `_gate()` refuses its operational verbs and `doctor` with exit 4 (`quarantined`) before it resolves a project or a policy row, [machine administration](#machine-administration) included, while safe discovery stays available. Allowed leaves the two scopes deciding exactly as below. `capabilities install` writes `quarantined` for a capability new to the machine and `allowed` when given `--allow`; reinstalling or updating keeps the state, and uninstalling drops it. `capabilities allow` and `capabilities quarantine` change it, and lifting a quarantine is the user's decision, never an agent's.
 
 ```python
 def _project_root() -> Path | None:
@@ -378,7 +447,11 @@ def _gate() -> None:
 | absent | `true` | enabled by inheritance |
 | absent | `false` or absent | disabled |
 
-The gate is a **guardrail, not a security boundary** — project resolution remains cwd-based. A malformed policy is a configuration error and operational absence is closed. The exit-4 envelope routes the scope decision to the human. Bundled service `init`, `start`, `run`, and `join` additionally require explicit project enable: inherited global availability grants CLI use, not ownership of a project daemon or consent to a machine one. A service that declares `service.machine` takes `--machine` on its service verbs, and such a call is the one operational use that resolves no project and reads no policy row: the machine service acts for a project only while that project explicitly enables the capability and is on the service's opt-in list, and checks both itself before every action it takes for that project ([machine mode](#machine-mode)). The read-only switch refuses its `init`, `start`, `run`, `reload`, and `leave` as it refuses a project's. This rule lives once in the preamble: `_gate()` applies it only when the executable declares a `SERVICE` manifest surface, so each service implements its lifecycle without repeating policy logic and domain commands merely named `service` remain ordinary CLI verbs.
+The gate is a **guardrail, not a security boundary** — project resolution remains cwd-based. A malformed policy is a configuration error and operational absence is closed. The exit-4 envelope routes the scope decision to the human. Bundled service `init`, `start`, `run`, and `join` additionally require explicit project enable: inherited global availability grants CLI use, not ownership of a project daemon or consent to a machine one. A service that declares `service.machine` takes `--machine` on its service verbs, and such a call resolves no project and reads no policy row: the machine service acts for a project only while that project explicitly enables the capability and is on the service's opt-in list, and checks both itself before every action it takes for that project ([machine mode](#machine-mode)). `migrate` of a capability that declares `TABLES` likewise resolves no project and reads no policy row, because it acts on the machine's store rather than for a project and the manager runs it outside any project; it still answers to the machine ceiling, and `migrate`, not `migrate status`, to the read-only switch. The read-only switch refuses its `init`, `start`, `run`, `reload`, and `leave` as it refuses a project's. This rule lives once in the preamble: `_gate()` applies it only when the executable declares a `SERVICE` manifest surface, so each service implements its lifecycle without repeating policy logic and domain commands merely named `service` remain ordinary CLI verbs.
+
+### Machine administration
+
+A call that administers the machine rather than acting for a project reads no policy row, so neither a project's policy nor the global policy decides it; it answers to the machine ceiling, and its writes to the read-only switch. It is the machine-service call and `migrate` above, and three more. Outside any project, a [machine read](#machine-reads) - a verb in `MACHINE_READS` or one a `LINK_METHODS` ceremony runs - and [`setup`](#setup) reporting the machine's prerequisites, because no project's policy could govern them and the machine's connections are lent to them only read-only. Wherever it runs, a write to the machine's own configuration that says so: `setup set|unset --machine` and [`connection add|remove --machine`](#connection-addremove). A write is machine administration only when it carries `--machine`, never by inference from the working directory or `CLAUDE_PROJECT_DIR`; without it `setup set|unset` and `connection add|remove --global` pass the gate as every operational verb does. Inside a project a read is never machine administration. `_gate()` decides it once, in `_machine_administration()`, and only for the verbs the contract itself answers, so a domain verb of the same name stays under the gate.
 
 ## Bundled services
 
@@ -472,7 +545,7 @@ A missing required value fails through `_die` with the exact remediation for bot
 
 **Credential scope** is declared in the manifest (`SCOPE`). `project` — the default — homes the secret in the project's `.env`/`.env.local`, nothing global: the shape for service- and tenant-scoped tools. `user` homes it in `~/.config/<name>/credentials.env`: reserved for personal-account tools where one human has one identity. Scope names where install scaffolds and where `doctor` points its remediation; the cascade itself consults all four tiers, identically, regardless of scope.
 
-`credentials.env` is **human-written only**: a script never writes back into it. An artifact a login ceremony mints — a session cookie, an exchanged token — is state and lands in the state directory ([below](#state)). One writer per file, everywhere.
+`credentials.env` is **human-written only**: a script never writes back into it of its own accord. What it holds comes from a person, by hand or through the contract's `connection add` and `setup set`, which take a secret on stdin at that person's request ([what a person is asked for](#what-a-person-is-asked-for)). An artifact a login ceremony mints — a session cookie, an exchanged token — is state and lands in the state directory ([below](#state)). One writer per file, everywhere.
 
 A capability whose secret is not a flat token resolves it in its own shape — keyed indirectly through a config file, or persisted after a login exchange — but the **tiers and their order are preserved**: an explicit override beats project config beats user config beats process env, resolved by deterministic code. The shape may vary; the order may not.
 
@@ -480,7 +553,7 @@ A capability whose secret is not a flat token resolves it in its own shape — k
 
 Every connection-bearing capability resolves its configuration as **explicit named connections**. A registry is required even when there is only one connection; environment variables resolve values for that declared connection but never create an identity implicitly. Core-only capabilities omit the connections tier and report an empty connections map.
 
-Endpoints and identities are declared as **connection records**, written at configuration time by whoever configures and read through the shared adapter. The two scopes are project then global. They compose by connection id: the highest scope declaring an id supplies that entire identity, while other ids inherit from the lower scope. A separate grant record carries `enabled` and `allow_write`, so project permission can change without restating identity. In files mode the compatible representation stores identities and grants together in `connections.json`; in database mode they remain separate collections.
+Endpoints and identities are declared as **connection records**, written at configuration time by whoever configures and read through the shared adapter. The two scopes are project then global. They compose by connection id: the highest scope declaring an id supplies that entire identity, while other ids inherit from the lower scope. A separate grant record carries `enabled` and `allow_write`, so project permission can change without restating identity. An identity the project declares is the project's to use; one inherited from the global scope is withheld until a grant resolving at project scope says `enabled: true` - grant before use. In files mode `connections.json` stores identities and grants together.
 
 ```json
 {
@@ -500,6 +573,27 @@ The envelope is the standard's; the entry **interior** is the capability's (host
 - **`allow_write`** — the connection's write gate ([below](#the-write-gate)), represented logically as a grant. Absent falls to the capability's declared `WRITE_DEFAULT`.
 
 Non-secret values sit literally in the entry: chosen, committed, per-connection project config — both the wiring (endpoints, workspaces) and any behavioural per-connection keys the capability defines.
+
+### Connections in the store
+
+A project keeps its connections, grants, identifiers and policy in one of two homes: the files above, in files mode, or the project's store, in store mode, which serves a project whose agents run on more than one node. One mode owns a project at a time and the two never compose with each other. Either is read through the same records adapter, so `_connections_registry()` below, the gate, the `ids` verbs and every verb above them behave the same in both. A project is in store mode when its `project.json` says `"records": "store"`, and in files mode otherwise; the mode is never inferred from a configured store. A `project.json` saying `"connections": "store"` keeps only its connections and grants in the store, and its identifiers and policy in files. The manager alone writes these keys, through `capabilities connections import`, which writes the rows the project's files resolve to, proves the store resolves the same records, and only then records `"records": "store"`; it never overwrites a row that differs, and run again it changes nothing. The machine ceiling, the harness deny rule and the project's `slug` and `schema` stay in files in either mode.
+
+Store mode keeps four tables, owned by the contract and migrated under its own ledger in the schema the project's [store setting](#the-store-setting) names:
+
+| Table | Columns |
+|---|---|
+| `capabilities_connections` | `capability`, `name`, `spec` (jsonb); one row per connection, keyed by `capability` and `name` |
+| `capabilities_connection_grants` | `agent_id`, `capability`, `connection`, `node` (nullable), `enabled`, `allow_write`, `is_default` |
+| `capabilities_identifiers` | `agent_id` (nullable), `capability`, `label`, `value` (jsonb), `note`, `updated_at`; one row per agent (or none), capability and label |
+| `capabilities_policy` | `agent_id` (nullable), `capability`, `node` (nullable), `enabled`, `updated_at`; one row per agent (or none), capability and node (or none) |
+
+`spec` is the entry interior, the same object a `connections.json` entry holds, and carries secret references only: each secret stays named by its `*_env` field and its value never enters the store. The value resolves on each node through that node's own cascade tiers 2–4, so one row serves every node while each node keeps its own values.
+
+`agent_id` is the project id, the `prj_<12hex>` value the project's identity carries, held as text and never as a foreign key, because the identity's home is outside these tables; `connection` refers to a connection row of the same capability inside them. `node` names the node a grant is for and is null for every node; a grant naming the running node is used before the grant for every node, field by field as grants resolve, and the running node is the name the store tier's `node_name()` returns: the name the machine declares in `AGENT_NODE_NAME`, and its host name where it declares none, so a container that declares one keeps its name across redeploys while its host name, the container id, changes. `enabled` or `allow_write` left null decides nothing, as a field absent from a file's grant does, so `allow_write` still falls to `WRITE_DEFAULT`. `is_default` is the default pointer, held by at most one grant per agent, capability and node.
+
+Every rule of [connections](#connections) holds unchanged. A connection row is used whole, never assembled from two rows. A row belongs to no project, so it is withheld from a project until that project's grant enables it, as an identity inherited from the global scope is in files mode. `allow_write` resolves through [the write gate](#the-write-gate), the read-only switch closes every gate, and a grant that resolves to `enabled: false` leaves the connection out of the set. `<name> connections` reads the store to report a resolution and reaches nothing a connection names. A store that cannot be reached refuses with `store_unreachable` and exit 5, never as `connection_not_granted`.
+
+An identifier or a policy row whose `agent_id` is null is global: it applies to every project that reads the store, on every machine, and a project's own row with the same label or capability is read before it. Identifiers carry no versions: `ids set` overwrites a row and `ids rm` deletes it. A policy row's `node` names the node it is for and is null for every node, the running node being `node_name()` as for grants, so the gate resolves from the first of the project's row for this node, its row for every node, the global row for this node and the global row for every node, and is denied where none exists; the scope that answered is the scope [the gate](#the-capability-policy-gate) acts on, so service activation still takes a project row. A policy record says which node the row that answered names (`node`, null for every node), and only the project's row naming a node places a capability's bundled service on that node. The manager writes policy rows for every node through `enable`, `disable` and `inherit`, and for one node with `--node <node>`, which files mode refuses as `node_requires_store` because files carry no node; a write that stamps the project id takes it only once it is verified. With the gate in the store every gated call reads the store, and a store that cannot be reached refuses it with `store_unreachable` and exit 5.
 
 ### Selection
 
@@ -561,11 +655,11 @@ The principle: **the cascade resolves values; a gate is not a value.** No flag, 
 
 ### Machine reads
 
-Outside any project there is no scope a grant could be written in, so a capability may declare, beside `WRITE_DEFAULT`, the read verbs that there use the machine's own connections: `MACHINE_READS = ("connections", "doctor")`, a tuple of verbs the capability exposes, none of them a write verb, which the manager validates wherever it validates a capability. Absent or empty, the capability has no machine reads. Outside any project a declared verb sees every connection declared globally whose grant does not resolve to `enabled: false`, each one a source whatever its grant or `WRITE_DEFAULT` says, so a write through it exits 4 `read_only`, and `connections` names each one as the machine's under `machine_reads`. Every other verb outside a project is refused the machine's connections, and inside a project grants alone decide what every verb may use. The policy gate and the machine ceiling come first, as for any verb, and the read-only switch still closes every gate.
+Outside any project there is no scope a grant could be written in, so a capability may declare, beside `WRITE_DEFAULT`, the read verbs that there use the machine's own connections: `MACHINE_READS = ("connections", "doctor")`, a tuple of verbs the capability exposes, none of them a write verb, which the manager validates wherever it validates a capability. Absent or empty, the capability has no machine reads. Outside any project a declared verb sees every connection declared globally whose grant does not resolve to `enabled: false`, each one a source whatever its grant or `WRITE_DEFAULT` says, so a write through it exits 4 `read_only`, and `connections` names each one as the machine's under `machine_reads`. A verb a [`LINK_METHODS`](#linking-a-connection) ceremony runs uses them there the same way, so a connection declared globally is linked on the machine before any project is granted it; each ceremony's `argv` names the capability and then that verb, one the capability exposes and not a write verb, which the manager validates wherever it validates `MACHINE_READS`. Every other verb outside a project is refused the machine's connections, and inside a project grants alone decide what every verb may use. Outside any project a machine read is [machine administration](#machine-administration): it reads no policy row and answers to the machine ceiling first, and the read-only switch still closes every gate.
 
 ### `connections` — the resolution report
 
-`<name> connections` prints where every value of every declared connection resolves from — the programmatic answer to *"which credentials is this using, and from where?"*. It is **purely local**: resolution only, no network, no authentication attempt (readiness stays `doctor`'s question). The report always carries the same shape, so a consumer never branches on cardinality:
+`<name> connections` prints where every value of every declared connection resolves from — the programmatic answer to *"which credentials is this using, and from where?"*. It is **purely local**: resolution only, no authentication attempt and no call to any system a connection names (readiness stays `doctor`'s question); in store mode reading the store is the resolution. The report always carries the same shape, so a consumer never branches on cardinality:
 
 ```json
 {
@@ -598,6 +692,61 @@ Beside the connections the report carries `policy`, the capability's effective p
 
 A **core-only** capability — one carrying the `capability core` fence and no `connections` fence, because it has nothing to resolve (it drives a local tool or the host, with no credentials or endpoint) — still answers `connections`, reporting an empty map: `{ "connections": {}, "default": null }`. That absence is the contract, not a gap: `audit` accepts the empty report in place of the explicit-registry checks, and never writes a registry against such a capability.
 
+## What a person is asked for
+
+What a capability needs from a person is declared once, at the top of the script, so any reader - `manifest`, an agent, a control panel - renders it and drives it without knowing the capability. Four declarations, each optional:
+
+- `CONN_FIELDS` - the fields of one connection entry, the interior [connections](#connections) leaves to the capability.
+- `SETUP_FIELDS` - what the machine is given once, before any connection: an app's own credentials, a key a side feature uses. Each is an env key, kept in the capability's `credentials.env` and resolved through [the credential cascade](#the-credential-cascade).
+- `LINK_METHODS` - the interactive ceremonies that link a connection to an account.
+- `SETTINGS` - where the capability's settings live and the keys it declares ([settings](#settings)).
+
+A field, in `CONN_FIELDS`, `SETUP_FIELDS` and `SETTINGS.keys` alike:
+
+| Key | Meaning |
+|---|---|
+| `key` | The entry field, env key or dotted settings key it is written to. |
+| `label`, `help` | What a person is shown: a few words, and one sentence. |
+| `type` | `string`, `integer`, `number`, `boolean`, `url`, `email`, `phone`, `path`, `enum` (with `choices`), `list` or `object`. |
+| `required` | Whether a connection is incomplete without it. |
+| `secret` | The value is a secret: it is taken only on stdin and never from argv, and never sits in a record. A secret connection field's `key` is the entry field that names its env key (`secret_env`, `db_password_env`), and `env` is the template of that key, `{ID}` standing for the connection id upper-cased with every other character an underscore. |
+| `default`, `minimum`, `maximum`, `choices` | Optional: the value used when none is given, and the bounds a value is checked against. |
+
+The manager validates the declarations wherever it validates a manifest.
+
+### `connection add|remove`
+
+`<name> connection add <id> [--project|--global|--machine] [--default] [--replace] [--field KEY=VALUE ...] [--stdin]` writes one connection from the declared fields, and is answered the same way by every capability that declares `CONN_FIELDS`. A non-secret field may come on argv; every field may come in one JSON object on stdin, and a secret field only there. A secret is written to the credentials file of the scope the record lands in - the project's `.env.local` for `--project`, the default, or the capability's `credentials.env` for `--global` and `--machine` - under its own env key, single-quoted, the file replaced atomically at mode 0600 and read back through the cascade's parser, and the entry names the key. The entry is written through the records adapter, so a project in store mode keeps it in its store as any connection. `--machine` writes at the machine's scope, as `--global` does, as [machine administration](#machine-administration), and refuses beside `--project`. A connection that already exists at the scope is refused with exit 6 `connection_exists` unless `--replace` is given; a replaced connection keeps every field not given, and `null` in the JSON object clears one. Required fields left unset refuse with exit 6 `fields_required`, a secret on argv with exit 6 `secret_on_argv`. `--default` points the scope's default at it. The answer names the record, the credentials file and every field as it now resolves, secrets masked, and, for a global connection used inside a project, the grant it still needs.
+
+`<name> connection remove <id> [--project|--global|--machine]` removes the entry, the default pointer when it names it, and every secret line `connection add` wrote for it; a key another connection at that scope names is kept. It refuses with exit 6 `connection_granted`, naming each project, while a project is granted the connection and would lose it: for a connection kept in the store, every project the store holds a grant enabling it for, on any node (`Records.grantees`); for a connection of the machine, the project the call runs in when that project grants it and declares no connection of its own under that id. A project's own connection in its files is granted to no other project. A project switches its grant off before the connection is removed.
+
+### `setup`
+
+`<name> setup` reports each declared prerequisite: whether it resolves, from which tier and file, secrets masked, and `ready` when every required one does. `setup set [--machine] [--field KEY=VALUE ...] [--stdin]` writes them to the capability's `credentials.env`, a secret only from the JSON object on stdin, and `setup unset [--machine] <KEY> ...` removes them. Outside any project `setup` reporting is [machine administration](#machine-administration), and so is a write that carries `--machine`. Every connection of the capability resolves them through the cascade, so a control panel asks for them once, above the connections.
+
+### Linking a connection
+
+A verb that links a connection to an account interactively - a QR to scan, a code to enter, a two-step password - takes `--events`, and is then drivable with no terminal. It speaks JSON lines on stdout, one object per line naming its `event`, and reads the answer to each event that asks for one as one line on stdin:
+
+| Event | Fields | Meaning |
+|---|---|---|
+| `qr` | `payload`, `expires`?, `refreshed` | A QR to render and scan; a new one follows each that expires. |
+| `pairing_code` | `code`, `phone` | A code the person enters on the phone. |
+| `phone_needed` | | Answer with the phone number. |
+| `code_needed` | `phone`, `retry` | Answer with the code the service sent. |
+| `password_needed` | `hint`, `retry` | Answer with the account's two-step password. |
+| `linked`, `progress` | the capability's | The link completed; the ceremony is still at work. |
+| `done` | `result` | The result the verb prints without `--events`, as the last line. |
+| `error` | `exit`, `error` | The refusal, as the last line; the same envelope also goes to stderr. |
+
+Standard input closing while an answer is awaited exits 6 `input_closed`. The exit code is the one the verb has without `--events`, and without `--events` the verb is unchanged. `LINK_METHODS` names each ceremony - `id`, `label`, `help` and its `argv`, which carries `--events` - to be run with `--connection <id>` added. The contract carries the stream (`_events_begin`, `_event`, `_event_answer`): once a verb begins it, `_emit` writes the `done` event and `_die` the `error` event.
+
+### Settings
+
+A capability that keeps settings declares where: `SETTINGS["homes"]`, one home per scope, each `{ "scope", "path", "format", "inherits"?, "seed"? }`. `scope` is `project` (the path is under the capability's folder in the project envelope), `global` (under its folder in the user's config home, the defaults every project reads beneath its own) or `machine` (under the same folder, the settings of the capability's machine service); `format` is `json` or `toml`; `inherits` names the scope a top-level key absent here is read from, as the records adapter merges a project's settings over the global ones; `seed` is the document a file not yet written starts as. `SETTINGS["keys"]` declares the keys a control panel shows as controls, each a field as above with `scope`, and `apply`: `next_call` (read afresh by the next call), `reload` (a running service takes it on `service reload`) or `restart` (only a stopped and started one does). Keys not declared are still read and written; they are what a panel shows as JSON.
+
+`<name> settings [--scope S]` reads every home whole, with each declared key's value and the scope it came from. `settings get <key>`, `settings set <key> <value>`, `settings unset <key>` (a dotted key reaches a nested one; `<value>` is read as JSON, else as text) and `settings put < document.json`, which replaces one scope's document, write through one surface whatever the home's format; `--scope` defaults to the key's declared scope, else the only home. A declared key's value is checked against its declaration, then the whole document as the capability itself reads it - `_settings_check(scope, document, path)`, outside the fences, returns the problems its own reader finds in the file about to replace the home - and a refusal is exit 6 `settings_invalid` with nothing written. The file is replaced atomically; a TOML home is rewritten from its content, so its comments are not kept. The answer names `apply`, so a caller knows whether to `service reload`. Under the read-only switch every write is refused.
+
 ## Identity-free
 
 A shared tool bakes in no consumer's identity — no person, company, tenant, account, or host-with-tenant **value** (DOCTRINE rule 10). The consumer supplies those through the cascade; the tool refers to them by role. Config-key *names* (`<NAME>_API_KEY`, `<NAME>_WORKSPACE`) are structural and belong in the script; the *values* never do. This holds in the help text too: examples use placeholders (`user@example.com`, `<PERSON>`), never a real name or address. A default that would otherwise hardcode a consumer (an author or actor name, a default identity) is sourced from env/config with no baked-in fallback — absent the value, the tool asks for it rather than assuming one.
@@ -620,7 +769,7 @@ def _state_dir() -> Path:
     return _STATE_HOME / NAME
 ```
 
-- **Project scope** → `<root>/capabilities/<name>/state/` — session cookies, scrape caches, pin-pending markers, session maps, each project isolated to its own account session. The manager-owned `capabilities/.gitignore` guarantees `*/state/` never commits. Outside an initialized envelope state falls back to the user state home; operational use there still requires global policy enable and an explicit global connections registry where the capability bears connections.
+- **Project scope** → `<root>/capabilities/<name>/state/` — session cookies, scrape caches, pin-pending markers, each project isolated to its own account session. The manager-owned `capabilities/.gitignore` guarantees `*/state/` never commits. Outside an initialized envelope state falls back to the user state home; operational use there still requires global policy enable and an explicit global connections registry where the capability bears connections.
 - **User scope** → `$XDG_STATE_HOME/<name>/` (default `~/.local/state/<name>/`).
 
 A stateful capability keys its state **per connection** — `<state-dir>/<connection-id>/…` — so two connections of one capability never share a session. The guides cache is the exception: guide content is capability-scoped and connection-independent, so it stays unkeyed at the user state home.
@@ -628,6 +777,16 @@ A stateful capability keys its state **per connection** — `<state-dir>/<connec
 **Bulk data stores are relocatable at the root, fixed inside.** A capability that syncs bulk data (message archives, exports) defaults the store to `<state-dir>/<connection-id>/…` like any state — and MAY expose the **root** as a per-connection key on the connection entry (e.g. `messages_dir`: absolute, or relative to the project root) for a consumer who wants the data elsewhere. Only the root moves: the structure beneath it is the CLI's contract, documented in its help, identical wherever the root points. The `*/state/` gitignore guard covers only the default location, so the guard travels as a responsibility: `doctor` verifies the active root is git-ignored and warns when it is not (DOCTRINE rule 16 — synced data is minted by credentials and never commits).
 
 Known limitation, recorded for fast diagnosis: two projects driving the *same* account of a single-session service thrash each other's cookies (login here invalidates the cookie there). Per-project state trades that for account isolation — the right trade where re-logins are cheap.
+
+## Runtime state in the store
+
+Runtime state is what a capability's own processes coordinate through — a service's run ledger, its job tables, the session a capability resumes from one call to the next — and it lives in the PostgreSQL its project's database setting resolves to ([the store setting](#the-store-setting); DOCTRINE rule 22).
+
+A capability reaches it through the shared database library, `capabilities-contract` on PyPI, imported as `capabilities_contract.db` and pinned to an exact version in the script's PEP-723 dependencies. The library resolves the database setting for a project root through the cascade and writes nothing, connects bound to the schema that setting names, and applies each owner's migration steps once under that owner's ledger; the library's own documentation carries its call surface and error codes. The capability is the owner of its tables: the owner is its name, every object a migration step creates is named `<name>_…` inside the setting's schema, and its steps are recorded in the ledger under that name, so tools at different releases share one database and each changes only its own tables.
+
+**Migrations run when asked.** A capability that keeps tables declares `TABLES = True` beside `STATE`, and a `_tables()` builder returning its steps and its schema version `(steps, major, minor)`; the vendored contract then answers `<name> migrate`, which applies the pending steps under the library's lock, and `<name> migrate status`, which reports where the tables stand without a lock and changes nothing. Three callers ask for it: the manager runs `<name> migrate` when it installs or updates the payload, so the tables reach the code where the code arrives, and reports a refusal without undoing the payload; a service runs it once when it starts; and an ordinary call that finds its tables missing or older than its code migrates once on the library's locked fallback path. Every other call takes no lock and applies nothing. The library bounds each wait - a connect, a lock - and reports one that runs out as `store_unreachable` or `store_busy`, so `doctor` answers within a watchdog's timeout rather than hanging, and both ends of a connection probe an idle peer so the store drops a client that died; the bounds are the library's to state.
+
+A service that keeps runtime state resolves the store before it takes any work. With no store configured it refuses to run with the error code `store_not_configured` and a hint naming the `AGENTKIT_DB_*` keys and `capabilities store set`, and its `service doctor` reports the same. The library finds a store only through the cascade of [the store setting](#the-store-setting), and every level names a PostgreSQL.
 
 ## The I/O contract
 
@@ -704,14 +863,15 @@ A 429 honours the server's `Retry-After` header (falling back to the linear sche
 
 Every CLI has a `doctor` subcommand: the cheapest authenticated round-trip that proves the whole chain — credentials resolved, endpoint reachable, identity confirmed. It examines **every connection**: bare, it round-trips each configured connection and reports per id — `{"ok": <all healthy>, "connections": {"<id>": {…}}}` — exiting `0` only when every connection is healthy, else with the first failure's category; `doctor --connection <id>` checks one. Per connection it carries a few cheap facts (the service version, the authenticated identity, a reachability flag) and rides the same exit-code taxonomy — `0` healthy, `2` if credentials are missing or rejected, `5` if the service is unreachable. It is the first thing an agent runs against a tool, and for a stateful CLI it is also the recovery point: `doctor` detects an expired session and attempts re-authentication before reporting, so a healthy exit means *ready to work*, not merely *configured*.
 
-Credential resolution is the **first gate, and it is network-free**: before any round-trip, `doctor` resolves the connection(s) under test through the cascade — the *same* resolution [`connections`](#connections--the-resolution-report) reports — and refuses with exit `2` when any **required** key is unset, naming the remediation from the credential scope and `CRED_KEYS`. The verdict is the cascade's, read across its resolution tiers (`connection` literal, `project`, `user`, `env`) from the connection's own report rows — **never the presence of any single file**. One resolver, two consumers: `doctor`'s readiness gate and `connections`' report answer *"are the credentials here?"* through the same per-key resolution, so they cannot diverge — the failure mode where a `doctor` preflight checks one tier while the real commands resolve through all of them is structurally precluded.
+Credential resolution is the **first gate, and it calls no system a connection names**: before any round-trip, `doctor` resolves the connection(s) under test through the cascade — the *same* resolution [`connections`](#connections--the-resolution-report) reports — and refuses with exit `2` when any **required** key is unset, naming the remediation from the credential scope and `CRED_KEYS`. The verdict is the cascade's, read across its resolution tiers (`connection` literal, `project`, `user`, `env`) from the connection's own report rows — **never the presence of any single file**. One resolver, two consumers: `doctor`'s readiness gate and `connections`' report answer *"are the credentials here?"* through the same per-key resolution, so they cannot diverge — the failure mode where a `doctor` preflight checks one tier while the real commands resolve through all of them is structurally precluded.
 
 ```python
 def _missing_required(keys: list[dict]) -> list[str]:
     """Required report rows (from `_key_report`) that did not resolve through the
-    cascade — empty ⇒ credentials present. `doctor`'s network-free gate, derived
-    from the same per-key resolution `connections` prints, so the readiness gate
-    and the resolution report can never disagree."""
+    cascade — empty ⇒ credentials present. `doctor`'s first gate, which calls no
+    system a connection names, derived from the same per-key resolution
+    `connections` prints, so the readiness gate and the resolution report can
+    never disagree."""
     return [k["key"] for k in keys if k["required"] and not k["set"]]
 ```
 
