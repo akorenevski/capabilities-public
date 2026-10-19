@@ -1,5 +1,9 @@
 # my-notion — change log
 
+## 2026-10-19 — Pins the contract library the regions need
+
+The script header pins `capabilities-contract==0.5.1`, the library the restamped contract regions are written for. The 2026-10-19 contract sync stamped regions that call `connect(transaction=True)` but left the header on 0.4.1, so every command, `doctor` included, failed with `TypeError: connect() got an unexpected keyword argument 'transaction'` in a store-connected project.
+
 ## 2026-10-13 — Reads connections from the store
 
 A project whose `project.json` says `"connections": "store"` (written by `capabilities connections import`) or `"records": "store"` now resolves its connections and grants from the store. Before, my-notion read only a `"store"` key that the manager never writes, fell back to files, and refused every connection as withheld in every imported project. The contract regions are restamped from the official contract (`capabilities-contract==0.4.1`, now pinned in the script header).
