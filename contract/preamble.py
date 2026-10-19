@@ -49,12 +49,17 @@ turns on `connection add|remove`; `SETUP_FIELDS`, the machine prerequisites,
 which turns on `setup`; `LINK_METHODS`, the interactive ceremonies that link a
 connection; and `SETTINGS`, where the capability's settings live and the keys
 it declares, which turns on `settings`, with an optional
-`_settings_check(scope, document, path)` outside the fences returning the
-problems its own reader finds. Each is absent where it does not apply.
+`_settings_check(scope, document)` outside the fences returning the
+problems its own reader finds in the whole document as it would read it.
+Each is absent where it does not apply.
 Optionally, beside STATE, `TABLES = True` when the capability keeps tables in
 the machine's store, with a `_tables()` builder outside the fences returning
 `(steps, major, minor)` for the shared database library. Absent or false means
 none, and `migrate` is then left to the CLI's own parser.
+Optionally, `_migrate_files_mover(action, answers, all_answers)` outside the
+fences: how `migrate files` moves the capability's own configuration files of a
+project (profiles, workers, definitions) into the store for `capabilities
+migrate`. Absent means the capability has none of its own to move.
 
 The bare `help` verb is dispatched by `_contract` and reads the CLI's help
 body from a module-level `HELP` constant if defined, else the module docstring
@@ -106,6 +111,32 @@ def _die(exit_code: int, code: str, message: str,
         sys.stdout.flush()
     sys.stderr.write(json.dumps({"error": err}, ensure_ascii=False) + "\n")
     sys.exit(exit_code)
+
+
+def _store_lost(kind, exc, trace) -> None:
+    """A store connection lost where nothing caught it ends the command as the
+    store being unreachable, exit 5, rather than with a traceback: the database
+    library has already tried again everything it safely could."""
+    driver = sys.modules.get("psycopg")
+    if driver is None or not isinstance(exc, driver.OperationalError):
+        _UNCAUGHT[0](kind, exc, trace)
+        return
+    try:
+        _die(5, "store_unreachable",
+             "the store stopped answering: " + " ".join(str(exc).split())[:300],
+             "check the database setting with `capabilities store doctor`")
+    except SystemExit:
+        pass
+    import atexit
+    import os
+    atexit._run_exitfuncs()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(5)
+
+
+_UNCAUGHT = [sys.excepthook]
+sys.excepthook = _store_lost
 
 
 def _emit(value) -> None:
@@ -267,7 +298,6 @@ def _handed_off_envelope(root: Path) -> str:
 
 
 ENVELOPE_CACHE_VERSION = 1
-IDENTITY_CACHE_VERSION = 1
 
 
 def _record_file(kind: str, key: str) -> Path:
@@ -354,9 +384,9 @@ def _ask_manager(root: Path, *flags: str) -> tuple:
 
     env = dict(os.environ)
     env["CLAUDE_PROJECT_DIR"] = str(root)
-    # Asked at all, the manager answers from ContextKit: a live id hand-down for
-    # this root is used before asking, so any in the environment is this
-    # process's own and must not come back as the answer.
+    # Asked at all, the manager answers from the project itself: a live id
+    # hand-down for this root is used before asking, so any in the environment
+    # is this process's own and must not come back as the answer.
     env.pop("CAPABILITIES_PROJECT_ID", None)
     env.pop("CAPABILITIES_PROJECT_ID_ROOT", None)
     manager = os.environ.get("CAPABILITIES_MANAGER_BIN", "").strip()
@@ -469,74 +499,35 @@ def _project_capabilities_dir(root: Path) -> Path:
     return legacy
 
 
-_CONTEXT_IDENTITY: dict = {}
-
-
-def _context_identity(root: Path) -> dict:
-    """Whether a context owner binds this project, and the id it holds for it.
-
-    The capabilities manager owns the answer, as it owns the envelope's: this
-    reads the manager's record while every input it rests on stands, and asks
-    the manager otherwise. `{"bound", "id"}`, or `{"error"}` when the manager
-    cannot answer, which leaves reads on project.json and refuses writes."""
-    root = root.resolve()
-    known = _CONTEXT_IDENTITY.get(root)
-    if known is not None:
-        return known
-    if not (root / ".contextkit" / "config.toml").is_file():
-        # The binding the manager asks ContextKit about is absent, so the
-        # manager's answer is already known: unbound, with no id of its own.
-        _CONTEXT_IDENTITY[root] = {"bound": False, "id": None}
-        return _CONTEXT_IDENTITY[root]
-    entry = _cached_record("identity", IDENTITY_CACHE_VERSION, root)
-    if (entry is not None and isinstance(entry.get("bound"), bool)
-            and (entry.get("id") is None or isinstance(entry.get("id"), str))):
-        answer = {"bound": entry["bound"], "id": entry.get("id")}
-    else:
-        reply, error = _ask_manager(root, "--identity")
-        state = (reply or {}).get("project_identity")
-        if error or not isinstance(state, dict) or not isinstance(state.get("bound"), bool):
-            answer = {"error": error or {
-                "code": "capabilities_path_malformed",
-                "message": "the capabilities manager returned no project identity"}}
-        else:
-            answer = {"bound": state["bound"], "id": state.get("contextkit_id") or None}
-    _CONTEXT_IDENTITY[root] = answer
-    return answer
-
-
-def _identity_verdict(bound: bool, contextkit_id, cached_id) -> dict:
-    """Which id a project answers to, from the three facts that decide it.
-
-    Unbound, the project's own project.json is the source. Bound, ContextKit's
-    id is authoritative and project.json holds at most its copy; until
-    ContextKit has an id, the copy is the id it will adopt."""
-    if not bound:
-        return {"state": "unbound", "id": cached_id}
-    if contextkit_id is None:
-        return {"state": "pending", "id": cached_id}
-    if cached_id is not None and cached_id != contextkit_id:
-        return {"state": "mismatch", "id": contextkit_id}
-    return {"state": "adopted", "id": contextkit_id}
+def _manager_declared_id(root: Path) -> dict:
+    """The id the capabilities manager answers for a project whose project.json
+    declares none: it carries an id the project's ContextKit binding holds into
+    project.json once and answers it. `{"id"}`, or `{"error"}` when the manager
+    cannot answer."""
+    reply, error = _ask_manager(root, "--identity")
+    state = (reply or {}).get("project_identity")
+    if error or not isinstance(state, dict):
+        return {"error": error or {
+            "code": "capabilities_path_malformed",
+            "message": "the capabilities manager returned no project identity"}}
+    ident = state.get("id")
+    return {"id": ident.strip() if isinstance(ident, str) and ident.strip() else None}
 
 
 def _identity_refusal(state: dict):
     """Why a write may not stamp this project's id, or None when it may.
 
-    An unbound project without an id is left to the caller, whose refusal
-    already names `capabilities init`."""
+    A project without an id is left to the caller, whose refusal already names
+    `capabilities init`."""
     if state["state"] == "unresolved":
         return state["error"]
     if state["state"] == "mismatch":
         return {"code": "project_id_mismatch",
                 "message": f"project.json holds project id {state['project_json_id']}, "
-                           f"but ContextKit answers {state['contextkit_id']}",
-                "hint": "reconcile the two by hand: ContextKit's id is the "
-                        "project's, and project.json keeps only its copy"}
-    if state["state"] == "pending" and not state["id"]:
-        return {"code": "project_id_unassigned",
-                "message": "this project's ContextKit identity has no id yet",
-                "hint": "run `contextkit identity adopt` in the project"}
+                           f"but the process that started this one handed down "
+                           f"{state['handed_id']}",
+                "hint": "start the command again from the project itself, so the id "
+                        "is read from its project.json"}
     return None
 
 
@@ -570,11 +561,14 @@ def _project_id_state():
     """The id of the project this command stands in, where it came from, and
     whether a write may stamp it; None outside a project.
 
-    A live handoff for this root outranks ContextKit, as the envelope handoff
-    outranks the record: the process that handed it verified it. Otherwise the
-    manager's answer decides. An id a write may stamp is handed on to this
-    process's descendants. Reading it asks no records backend: the id is what
-    selects a project's records, so it is read before any of them."""
+    `capabilities/project.json` is the id's one home. A live handoff for this
+    root is that id as the launching process read it, so it is used as given
+    unless project.json now declares another, which a write refuses. Where
+    project.json declares none and the project carries a ContextKit binding,
+    the manager is asked: it copies an id that binding holds into project.json
+    once. An id a write may stamp is handed on to this process's descendants.
+    Reading it asks no records backend: the id is what selects a project's
+    records, so it is read before any of them."""
     root = _project_root()
     if root is None:
         return None
@@ -587,25 +581,25 @@ def _project_id_state_at(root: Path) -> dict:
         declared = json.loads((_project_capabilities_dir(root) / "project.json").read_text())
     except (OSError, ValueError):
         declared = None
-    cached = (str(declared.get("id") or "").strip() or None
-              if isinstance(declared, dict) else None)
+    declared = (str(declared.get("id") or "").strip() or None
+                if isinstance(declared, dict) else None)
     handed = _handed_off_project_id(root)
     if handed and _PROJECT_ID_HANDED.get(str(root)) == handed:
         handed = ""  # this process's own hand-down, not its launcher's
-    if handed:
-        state = _identity_verdict(True, handed, cached)
-        if state["state"] != "mismatch":
-            state["state"] = "handed"
-        state.update(bound=None, contextkit_id=handed)
-    else:
-        context = _context_identity(root)
-        if "error" in context:
-            state = {"state": "unresolved", "id": cached, "bound": True,
-                     "contextkit_id": None, "error": context["error"]}
+    if handed and declared and handed != declared:
+        state = {"state": "mismatch", "id": declared, "handed_id": handed}
+    elif handed:
+        state = {"state": "handed", "id": handed}
+    elif declared is None and (root / ".contextkit" / "config.toml").is_file():
+        answer = _manager_declared_id(root)
+        if "error" in answer:
+            state = {"state": "unresolved", "id": None, "error": answer["error"]}
         else:
-            state = _identity_verdict(context["bound"], context["id"], cached)
-            state.update(bound=context["bound"], contextkit_id=context["id"])
-    state["project_json_id"] = cached
+            declared = answer["id"]
+            state = {"state": "declared" if declared else "undeclared", "id": declared}
+    else:
+        state = {"state": "declared" if declared else "undeclared", "id": declared}
+    state["project_json_id"] = declared
     if not handed and state["id"] and _identity_refusal(state) is None:
         os.environ["CAPABILITIES_PROJECT_ID"] = state["id"]
         os.environ["CAPABILITIES_PROJECT_ID_ROOT"] = str(root)
@@ -619,8 +613,8 @@ def _project_id(write: bool = False, refuse: bool = True):
     A read takes the id in every state. A write that stamps it takes it only
     once it is verified for this invocation, and otherwise exits 6 naming what
     to settle, or, with `refuse=False`, answers None so a read path that would
-    stamp the id can leave that step out instead of refusing. An unbound project
-    that declares no id is still None, left to the caller's own refusal."""
+    stamp the id can leave that step out instead of refusing. A project that
+    declares no id is still None, left to the caller's own refusal."""
     state = _project_id_state()
     if state is None:
         return None
@@ -867,7 +861,10 @@ def _gate() -> None:
     `migrate` of a capability that declares `TABLES` acts on the machine's
     store rather than for a project, so it too reads no policy row: it answers
     to the machine ceiling, and `migrate` (not `migrate status`) to the
-    read-only switch.
+    read-only switch. `migrate files` is the manager's `capabilities migrate`
+    moving this capability's files of a project into the store, whether or not
+    the project enabled it: it answers to the machine ceiling, and `migrate
+    files write` to the read-only switch.
 
     Machine administration reads no policy row either: it answers to the
     machine ceiling, and its writes to the read-only switch
@@ -879,6 +876,10 @@ def _gate() -> None:
     if not safe:
         _machine_gate()
     service_action = sys.argv[2] if len(sys.argv) > 2 else None
+    if verb == "migrate" and service_action == "files":
+        if sys.argv[3:4] == ["write"]:
+            _read_only_gate(f"`{NAME} migrate files write`")
+        return
     if verb == "migrate" and _tables_declared():
         if service_action != "status":
             _read_only_gate(f"`{NAME} migrate`")
@@ -1025,6 +1026,9 @@ def _env_dir() -> Path | None:
 
 
 _RECORDS = None
+# Who this process writes records as, where it is not the person running it:
+# `migrate` while `migrate files` moves the project's files into the store.
+_RECORDS_ACTOR = None
 
 
 def _records():
@@ -1045,9 +1049,9 @@ def _records():
             _RECORDS = open_records(
                 envelope, _CONFIG_HOME, project_only=project_only,
                 project_root=root, project_id=_project_id() if in_store else None,
-                application_name=NAME)
+                application_name=NAME, actor=_RECORDS_ACTOR)
         except StoreError as e:
-            _die(6, e.slug, e.message, e.hint)
+            _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
     return _RECORDS
 
 
@@ -1679,7 +1683,7 @@ def _cmd_migrate(argv: list[str]) -> None:
              f"run {NAME} through its own script header, which pins it")
     conn = None
     try:
-        conn = db.connect(application_name=NAME)
+        conn = db.connect(application_name=NAME, transaction=True)
         if argv:
             found = db.status(conn, NAME, steps, major=major, minor=minor)
             stored = (None if found.stored_major is None
@@ -1700,6 +1704,228 @@ def _cmd_migrate(argv: list[str]) -> None:
     finally:
         if conn is not None:
             conn.close()
+    _emit(report)
+
+
+# What `migrate files plan` reads its tables through: one connection per
+# database, held in one transaction that is never committed, in which the
+# steps of any table a migration would make or bring forward are run, so the
+# capability reads the store as an upgrade would leave it, and the transaction
+# is rolled back when the plan ends. The steps it ran, by owner.
+_PLAN_LINKS: dict = {}
+_PLAN_RAN: set = set()
+_PLAN_PENDING: dict = {}
+
+
+class _PlanConnection:
+    """A connection of a plan: the database's one plan link, where a commit
+    keeps what the caller did for the rest of the plan and a rollback or a
+    close undoes what it did since, and nothing ever reaches the store."""
+
+    _OWN = ("_real", "_setting", "_closed", "row_factory")
+
+    def __init__(self, real, setting):
+        object.__setattr__(self, "_real", real)
+        object.__setattr__(self, "_setting", setting)
+        object.__setattr__(self, "_closed", False)
+        object.__setattr__(self, "row_factory", None)
+
+    def __getattr__(self, name: str):
+        return getattr(self._real, name)
+
+    def __setattr__(self, name: str, value) -> None:
+        if name in self._OWN:
+            object.__setattr__(self, name, value)
+        elif name != "autocommit":
+            setattr(self._real, name, value)
+
+    @property
+    def autocommit(self) -> bool:
+        return False
+
+    @property
+    def closed(self) -> bool:
+        return self._closed or self._real.closed
+
+    def cursor(self, *args, **kwargs):
+        if self.row_factory is not None:
+            kwargs.setdefault("row_factory", self.row_factory)
+        return self._real.cursor(*args, **kwargs)
+
+    def execute(self, query, params = None, **kwargs):
+        return self.cursor().execute(query, params, **kwargs)
+
+    def transaction(self, *args, **kwargs):
+        return self._real.transaction(*args, **kwargs)
+
+    def commit(self) -> None:
+        self._real.execute("RELEASE SAVEPOINT capabilities_plan")
+        self._real.execute("SAVEPOINT capabilities_plan")
+
+    def rollback(self) -> None:
+        if not self._real.closed:
+            self._real.execute("ROLLBACK TO SAVEPOINT capabilities_plan")
+
+    def close(self) -> None:
+        if not self._closed:
+            self.rollback()
+        object.__setattr__(self, "_closed", True)
+
+    def __enter__(self) -> "_PlanConnection":
+        return self
+
+    def __exit__(self, kind, *exc) -> None:
+        if not self._closed:
+            if kind is None:
+                self.commit()
+            self.close()
+
+
+def _plan_store() -> None:
+    """Make every connection this process opens through the shared database
+    layer a plan connection, and every migration on one a step run inside the
+    plan's transaction and recorded under its owner, never committed: a plan
+    creates and upgrades nothing, whatever tables the capability reaches."""
+    try:
+        from capabilities_contract import db
+    except ImportError:
+        return
+    real_connect, real_migrate, real_status = db.connect, db.migrate, db.status
+
+    def plan_connect(*, application_name: str, project_root = None,
+                     setting = None, **kwargs):
+        # A plan holds one transaction open on its link for the whole run, so
+        # the link is a session connection whichever kind the caller asked for.
+        kwargs.pop("transaction", None)
+        setting = setting if setting is not None else db.resolve_setting(project_root)
+        key = (repr(sorted(setting.connect_kwargs().items())), setting.schema)
+        link = _PLAN_LINKS.get(key)
+        if link is None or link.closed or link.broken:
+            link = real_connect(application_name=application_name, setting=setting, **kwargs)
+            link.execute("SET TRANSACTION READ WRITE")
+            link.execute("SET LOCAL lock_timeout = '5s'")
+            link.execute("SAVEPOINT capabilities_plan")
+            _PLAN_LINKS[key] = link
+        return _PlanConnection(link, setting)
+
+    def held(conn, owner: str, steps, major: int, minor: int, schema):
+        fresh = real_connect(application_name=NAME, setting=conn._setting)
+        try:
+            return real_status(fresh, owner, steps, major=major, minor=minor,
+                               schema=schema or conn._setting.schema)
+        finally:
+            fresh.close()
+
+    def plan_status(conn, owner: str, steps, *, major: int, minor: int,
+                    schema = None):
+        if not isinstance(conn, _PlanConnection):
+            return real_status(conn, owner, steps, major=major, minor=minor, schema=schema)
+        found = held(conn, owner, list(steps), major, minor, schema)
+        found.pending = [s for s in found.pending if (id(conn._real), owner, s) not in _PLAN_RAN]
+        if found.state == "pending" and not found.pending:
+            found.state = "current"
+        return found
+
+    def plan_migrate(conn, owner: str, steps, *, major: int, minor: int,
+                     schema = None):
+        if not isinstance(conn, _PlanConnection):
+            return real_migrate(conn, owner, steps, major=major, minor=minor, schema=schema)
+        steps = list(steps)
+        found = held(conn, owner, steps, major, minor, schema)
+        if found.state in ("checksum_mismatch", "schema_too_new"):
+            raise db.DbError(found.state, f"the store's {owner} tables cannot be brought to "
+                             f"{major}.{minor}: {found.state}")
+        if found.pending:
+            _PLAN_PENDING[owner] = {
+                "from": None if found.stored_major is None
+                else f"{found.stored_major}.{found.stored_minor}",
+                "to": f"{major}.{minor}", "steps": list(found.pending)}
+        by_id = {}
+        for step in steps:
+            ident, text = (step.id, step.sql) if hasattr(step, "sql") else (step[0], step[1])
+            by_id[ident] = text
+        for ident in found.pending:
+            if (id(conn._real), owner, ident) in _PLAN_RAN:
+                continue
+            try:
+                with conn._real.transaction():
+                    conn._real.execute(by_id[ident])
+            except Exception as exc:
+                raise db.DbError("step_failed", f"step {ident} of {owner} could not be "
+                                 f"planned: {exc}") from None
+            _PLAN_RAN.add((id(conn._real), owner, ident))
+        # What the steps made stays for the rest of the plan, whichever
+        # connection of it rolls back later.
+        conn._real.execute("RELEASE SAVEPOINT capabilities_plan")
+        conn._real.execute("SAVEPOINT capabilities_plan")
+        return db.MigrateResult(owner=owner, schema=schema or conn._setting.schema,
+                                skipped=list(found.applied), major=major, minor=minor)
+
+    db.connect, db.migrate, db.status = plan_connect, plan_migrate, plan_status
+    here = globals()
+    here["_HOLD_RECORDS_CONNECTION"] = True
+    for name, value in list(here.items()):
+        for real, planned in ((real_connect, plan_connect), (real_migrate, plan_migrate),
+                              (real_status, plan_status)):
+            if value is real:
+                here[name] = planned
+
+
+MIGRATE_FILES_ACTIONS = ("plan", "write", "verify")
+
+
+def _cmd_migrate_files(argv: list[str]) -> None:
+    """`migrate files plan|write|verify [--answers FILE]` moves this
+    capability's own configuration files of the project into the store, for
+    the manager's `capabilities migrate`, which runs it on the agent's master
+    and owns the order: `plan` says what would be written and every question
+    code cannot answer, writing nothing; `write` writes it, leaving the files
+    for the manager to archive and remove; `verify` reads it back and says
+    whether the store now holds what the files said. The capability's own
+    `_migrate_files_mover(action, answers, all_answers)`, outside the fences,
+    does the moving and returns its report: `items`, `questions`, `files` (the
+    ones it consumed), `verified` and whatever else it names; a capability
+    without one moves nothing here. `--answers` is the person's recorded
+    answers as JSON, keyed by capability. Every record or setting written here
+    is the migration's own (`migrate@<node>`). `plan` changes nothing in the
+    store, tables included: a table it would make or bring forward is made or
+    brought forward only inside a transaction that is rolled back, and its
+    steps are named under `tables_to_upgrade` by owner."""
+    global _RECORDS_ACTOR
+    action = argv[0] if argv else ""
+    rest = argv[1:]
+    answers: dict = {}
+    if rest[:1] == ["--answers"] and len(rest) == 2:
+        try:
+            answers = json.loads(Path(rest[1]).read_text())
+        except (OSError, ValueError) as e:
+            _die(6, "input", f"cannot read the answers file {rest[1]}: {e}")
+        if not isinstance(answers, dict):
+            _die(6, "input", f"the answers file {rest[1]} must hold a JSON object")
+    elif rest:
+        _die(6, "input", f"unknown migrate files arguments {' '.join(rest)!r}",
+             f"{NAME} migrate files plan|write|verify [--answers FILE]")
+    if action not in MIGRATE_FILES_ACTIONS:
+        _die(6, "input", f"migrate files needs one of {', '.join(MIGRATE_FILES_ACTIONS)}",
+             f"{NAME} migrate files plan|write|verify [--answers FILE]")
+    if _project_root() is None:
+        _die(6, "no_project", "migrate files moves a project's files, and this is not one",
+             "run it in the project; `capabilities migrate` does")
+    _RECORDS_ACTOR = "migrate"
+    if action == "plan":
+        # A plan writes nothing, the capability's tables included: it reads
+        # them as an upgrade would leave them and names the steps instead.
+        _plan_store()
+    mover = globals().get("_migrate_files_mover")
+    report = {"capability": NAME, "action": action, "mover": callable(mover),
+              "items": [], "questions": [], "files": [], "warnings": []}
+    if callable(mover):
+        mine = answers.get(NAME) if isinstance(answers.get(NAME), dict) else {}
+        report.update(mover(action, mine, answers) or {})
+    if _PLAN_PENDING:
+        report["tables_to_upgrade"] = dict(_PLAN_PENDING)
+    if action == "verify":
+        report.setdefault("verified", True)
     _emit(report)
 
 
@@ -1805,7 +2031,8 @@ def _manifest_core() -> dict:
             "state": STATE, "inventory": _inventory_declaration(),
             "post_install": POST_INSTALL, "tables": _tables_declared(),
             "connections": _connections_declaration(),
-            "settings": _settings_declaration()}
+            "settings": _settings_declaration(),
+            "migrate_files": callable(globals().get("_migrate_files_mover"))}
 
 
 def _field_value(field: dict, raw, from_argv: bool = False):
@@ -1934,7 +2161,28 @@ def _settings_home_path(home: dict) -> Path | None:
     return _CONFIG_HOME / NAME / home["path"]
 
 
-def _settings_read(home: dict) -> tuple[Path | None, dict | None, str | None]:
+def _settings_in_rows(home: dict) -> bool:
+    """Whether one home's document is rows of the store: a project or global
+    home of an agent whose records moved there. A machine home stays a file."""
+    if home.get("scope") not in ("project", "global") or _project_root() is None:
+        return False
+    try:
+        return _records().settings_kept() == "store"
+    except StoreError as e:
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+
+
+def _settings_read(home: dict) -> tuple:
+    """One home's document: where it is kept, the document (None where there
+    is none yet) and what keeps it from being read. Where the home is rows,
+    `where` names the store's table rather than a file."""
+    if _settings_in_rows(home):
+        try:
+            records = _records()
+            return (records.collection_source(NAME, "setting"),
+                    records.setting_document(NAME, home["scope"]), None)
+        except StoreError as e:
+            _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
     path = _settings_home_path(home)
     if path is None or not path.is_file():
         return path, None, None
@@ -1952,18 +2200,34 @@ def _settings_read(home: dict) -> tuple[Path | None, dict | None, str | None]:
     return path, document, None
 
 
-def _settings_dig(document, key: str):
-    """The value at a dotted key, and whether it is there."""
+def _settings_parts(key) -> list:
+    """A settings key as the keys from the document root: a dotted path, or a
+    JSON array of keys for a path whose keys contain dots."""
+    if isinstance(key, (list, tuple)):
+        return [str(part) for part in key]
+    if key.startswith("["):
+        try:
+            parts = json.loads(key)
+        except ValueError:
+            parts = None
+        if isinstance(parts, list) and parts and all(
+                isinstance(part, str) and part for part in parts):
+            return parts
+    return key.split(".")
+
+
+def _settings_dig(document, key):
+    """The value at a key, and whether it is there."""
     here = document
-    for part in key.split("."):
+    for part in _settings_parts(key):
         if not isinstance(here, dict) or part not in here:
             return None, False
         here = here[part]
     return here, True
 
 
-def _settings_put(document: dict, key: str, value) -> None:
-    parts = key.split(".")
+def _settings_put(document: dict, key, value) -> None:
+    parts = _settings_parts(key)
     here = document
     for part in parts[:-1]:
         if not isinstance(here.get(part), dict):
@@ -1972,8 +2236,8 @@ def _settings_put(document: dict, key: str, value) -> None:
     here[parts[-1]] = value
 
 
-def _settings_drop(document: dict, key: str) -> bool:
-    parts = key.split(".")
+def _settings_drop(document: dict, key) -> bool:
+    parts = _settings_parts(key)
     here = document
     for part in parts[:-1]:
         here = here.get(part) if isinstance(here, dict) else None
@@ -2033,10 +2297,20 @@ def _toml_dumps(document: dict, prefix: tuple = ()) -> str:
 
 
 def _settings_write(home: dict, path: Path, document: dict) -> None:
-    """Replace one home's document whole: written beside it, checked by the
-    capability where it checks its settings, then renamed over it."""
+    """Replace one home's document whole: checked by the capability where it
+    checks its settings, written beside it, then renamed over it."""
+    try:
+        _records().guard_write(NAME, "setting", home.get("scope"))
+    except StoreError as e:
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
     text = (_toml_dumps(document) if home.get("format") == "toml"
             else json.dumps(document, ensure_ascii=False, indent=2) + "\n")
+    check = globals().get("_settings_check")
+    problems = [str(p) for p in (check(home["scope"], document) or [])] if check else []
+    if problems:
+        _die(6, "settings_invalid",
+             problems[0] if str(path) in problems[0] else f"{path}: {problems[0]}",
+             f"`{NAME} settings` shows the document; `{NAME} help` states the keys")
     path.parent.mkdir(parents=True, exist_ok=True)
     spare = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
@@ -2044,17 +2318,87 @@ def _settings_write(home: dict, path: Path, document: dict) -> None:
         fd = os.open(spare, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
         with os.fdopen(fd, "w") as handle:
             handle.write(text)
-        check = globals().get("_settings_check")
-        problems = [str(p).replace(str(spare), str(path))
-                    for p in (check(home["scope"], document, spare) or [])] if check else []
-        if problems:
-            _die(6, "settings_invalid",
-                 problems[0] if str(path) in problems[0] else f"{path}: {problems[0]}",
-                 f"`{NAME} settings` shows the document; `{NAME} help` states the keys")
         os.replace(spare, path)
     finally:
         if spare.exists():
             spare.unlink()
+
+
+def _settings_rows_write(home: dict, scope: str, change) -> dict:
+    """Change one home's document where it is rows, in the store's one
+    transaction: `change` takes the document and returns the new one, and the
+    capability's check reads the whole result before anything is written."""
+    check = globals().get("_settings_check")
+
+    def checked(document: dict) -> list:
+        return [str(p) for p in (check(scope, document) or [])] if check else []
+    try:
+        return _records().settings_write(NAME, scope, change, check=checked,
+                                         seed=home.get("seed"))
+    except StoreError as e:
+        if e.slug == "not_found":
+            _die(3, e.slug, e.message, e.hint)
+        if e.slug == "settings_invalid":
+            _die(6, e.slug, e.message,
+                 f"`{NAME} settings` shows the document; `{NAME} help` states the keys")
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+
+
+def _records_in_store() -> bool:
+    """Whether this project is an agent whose records and settings moved into
+    the store (its registry row has `migrated_at`): every record and settings
+    document it keeps is then rows, and no file of them is read or written."""
+    if _project_root() is None:
+        return False
+    try:
+        return _records().settings_kept() == "store"
+    except StoreError as e:
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+
+
+def _env_override(*keys: str, value=None):
+    """The first of `keys` the environment sets (or `value`, where the caller
+    read it elsewhere), naming a file to read records or settings from; for an
+    agent whose records moved into the store such a file is not read, so the
+    override is ignored with a one-line notice on stderr, and None returned."""
+    found = value if value is not None else next(
+        (os.environ.get(k) for k in keys if os.environ.get(k)), None)
+    if not found:
+        return None
+    if _records_in_store():
+        named = next((k for k in keys if os.environ.get(k)), keys[0] if keys else "override")
+        sys.stderr.write(f"{NAME}: {named} is ignored: this agent's records and settings "
+                         "are in the store, and no file is read for them\n")
+        return None
+    return found
+
+
+def _settings_diff(before: dict, after: dict) -> list:
+    """What changes between two documents, path by path: `-` removed, `+`
+    added, `~` changed."""
+    def leaves(document, prefix=()):
+        out = {}
+        for key, value in (document or {}).items():
+            if isinstance(value, dict) and value:
+                out.update(leaves(value, (*prefix, key)))
+            else:
+                out[(*prefix, key)] = value
+        return out
+
+    def name(path):
+        return (".".join(path) if all("." not in part for part in path)
+                else json.dumps(list(path), ensure_ascii=False))
+
+    def show(value):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    old, new = leaves(before), leaves(after)
+    lines = [f"- {name(p)}: {show(old[p])}" for p in sorted(set(old) - set(new))]
+    for p in sorted(new):
+        if p not in old:
+            lines.append(f"+ {name(p)}: {show(new[p])}")
+        elif show(old[p]) != show(new[p]):
+            lines.append(f"~ {name(p)}: {show(old[p])} -> {show(new[p])}")
+    return lines
 
 
 def _settings_key_decl(key: str, scope: str | None = None) -> dict | None:
@@ -2083,13 +2427,16 @@ def _settings_value(decl: dict, documents: dict) -> tuple:
 
 
 def _settings_report(scope: str | None) -> dict:
-    homes, documents = [], {}
+    homes, documents, in_rows = [], {}, False
     for home in _settings_homes(scope):
         path, document, error = _settings_read(home)
         documents[home["scope"]] = document
+        rows = _settings_in_rows(home)
+        in_rows = in_rows or rows
         row = {"scope": home["scope"], "format": home.get("format", "json"),
                "path": str(path) if path else None,
-               "exists": bool(path and path.is_file()), "document": document}
+               "exists": (document is not None) if rows else bool(path and path.is_file()),
+               "document": document}
         if home.get("inherits"):
             row["inherits"] = home["inherits"]
         if error:
@@ -2104,18 +2451,90 @@ def _settings_report(scope: str | None) -> dict:
             continue
         value, source = _settings_value(decl, documents)
         keys.append({**decl, "value": value, "from": source})
-    return {"capability": NAME, "declared": bool(globals().get("SETTINGS")),
-            "homes": homes, "keys": keys}
+    report = {"capability": NAME, "declared": bool(globals().get("SETTINGS")),
+              "homes": homes, "keys": keys}
+    if in_rows:
+        # Which state of the store this was assembled from: a reader holding
+        # these generations has read exactly what they name.
+        try:
+            report["generations"] = _records().setting_generations(NAME)
+        except StoreError as e:
+            _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+    return report
+
+
+def _settings_checked_put(scope: str, document) -> dict:
+    """A whole document given for `scope`, its declared keys checked."""
+    if not isinstance(document, dict):
+        _die(6, "input", "the settings document must be a JSON object")
+    for each in ((globals().get("SETTINGS") or {}).get("keys")) or []:
+        if each.get("scope") != scope:
+            continue
+        value, found = _settings_dig(document, each["key"])
+        if found:
+            try:
+                _field_value(each, value)
+            except ValueError as e:
+                _die(6, "settings_invalid", str(e))
+    return document
+
+
+def _settings_edit(home: dict, scope: str, current: dict, yes: bool) -> dict:
+    """The document after the person edited it in $VISUAL or $EDITOR, once
+    they confirmed what changes; None where they changed nothing."""
+    import shlex
+    import subprocess
+    import tempfile
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+    fd, name = tempfile.mkstemp(prefix=f"{NAME}-settings-{scope}-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(json.dumps(current, ensure_ascii=False, indent=2) + "\n")
+        try:
+            ran = subprocess.run([*shlex.split(editor), name])
+        except OSError as e:
+            _die(6, "editor_failed", f"cannot run the editor {editor!r}: {e}",
+                 "set VISUAL or EDITOR to an editor that waits until the file is closed")
+        if ran.returncode != 0:
+            _die(6, "editor_failed", f"the editor {editor!r} exited {ran.returncode}; "
+                 "nothing was written")
+        try:
+            edited = json.loads(Path(name).read_text())
+        except ValueError as e:
+            _die(6, "input", f"the edited document is not JSON: {e}; nothing was written")
+    finally:
+        try:
+            os.unlink(name)
+        except OSError:
+            pass
+    edited = _settings_checked_put(scope, edited)
+    diff = _settings_diff(current, edited)
+    if not diff:
+        return None
+    sys.stderr.write("\n".join(diff) + "\n")
+    if not yes:
+        if not sys.stdin.isatty():
+            _die(6, "confirm_required",
+                 f"the edit changes {len(diff)} path(s) and was not written",
+                 f"run `{NAME} settings edit` on a terminal to confirm, or pass --yes")
+        sys.stderr.write("write these changes? [y/N] ")
+        sys.stderr.flush()
+        if sys.stdin.readline().strip().lower() not in ("y", "yes"):
+            _die(6, "not_confirmed", "nothing was written")
+    return edited
 
 
 def _cmd_settings(argv: list[str]) -> None:
     """`settings` reads every settings document the capability keeps, wherever
-    it lives, with its declared keys resolved; `get`, `set`, `unset` and `put`
-    read and write them through one surface."""
+    it lives, with its declared keys resolved; `get`, `set`, `unset`, `put`,
+    `export` and `edit` read and write them through one surface. A key is a
+    dotted path, or a JSON array of keys where a key contains dots."""
     usage = (f"{NAME} settings [show] [--scope S] | get <key> [--scope S] | "
              "set <key> <value> [--scope S] | unset <key> [--scope S] | "
-             "put [--scope S] < document.json")
+             "put [--scope S] < document.json | export [--scope S] | "
+             "edit [--scope S] [--yes]")
     scope = None
+    yes = False
     rest = []
     i = 0
     while i < len(argv):
@@ -2126,21 +2545,25 @@ def _cmd_settings(argv: list[str]) -> None:
             i += 2
         elif argv[i] == "--json":
             i += 1
+        elif argv[i] == "--yes":
+            yes = True
+            i += 1
         else:
             rest.append(argv[i])
             i += 1
     sub = rest[0] if rest else "show"
     if sub == "show" and len(rest) <= 1:
         _emit(_settings_report(scope)); return
-    if sub not in ("get", "set", "unset", "put"):
+    if sub not in ("get", "set", "unset", "put", "export", "edit"):
         _die(6, "input", f"unknown settings subcommand {sub!r}", usage)
     if not globals().get("SETTINGS"):
         _die(6, "settings_undeclared", f"{NAME} declares no settings",
              f"`{NAME} manifest` carries `settings: null`")
-    key = rest[1] if len(rest) > 1 else None
+    key = rest[1] if len(rest) > 1 and sub not in ("export", "edit") else None
     if sub in ("get", "set", "unset") and not key:
         _die(6, "input", f"settings {sub} needs a key", usage)
-    decl = _settings_key_decl(key, scope) if key else None
+    decl_key = ".".join(_settings_parts(key)) if key else None
+    decl = _settings_key_decl(decl_key, scope) if key else None
     if scope is None:
         if decl and decl.get("scope"):
             scope = decl["scope"]
@@ -2154,11 +2577,12 @@ def _cmd_settings(argv: list[str]) -> None:
         _die(6, "unknown_scope", f"{NAME} keeps no settings at scope {scope!r}",
              f"scopes: {', '.join(h['scope'] for h in _settings_homes())}")
     home = homes[0]
+    rows = _settings_in_rows(home)
     path, document, error = _settings_read(home)
     if error:
         _die(6, "settings_unreadable", error)
     if document is None and sub != "put":
-        # A file not written yet starts as the document its home declares.
+        # A document not written yet starts as the document its home declares.
         document = json.loads(json.dumps(home.get("seed") or {}))
     if path is None:
         _die(6, "no_project", f"the {scope} settings live in a project and there is no "
@@ -2170,20 +2594,19 @@ def _cmd_settings(argv: list[str]) -> None:
                 _die(3, "not_found", f"{key} is not set at scope {scope}")
             value = decl.get("default")
         _emit(value if not isinstance(value, str) else json.dumps(value)); return
+    if sub == "export":
+        _emit(document or {}); return
     _read_only_gate(f"`{NAME} settings {sub}`")
     document = dict(document or {})
     previous = None
-    if sub == "put":
-        document = _stdin_document("the settings document")
-        for each in ((globals().get("SETTINGS") or {}).get("keys")) or []:
-            if each.get("scope") != scope:
-                continue
-            value, found = _settings_dig(document, each["key"])
-            if found:
-                try:
-                    _field_value(each, value)
-                except ValueError as e:
-                    _die(6, "settings_invalid", str(e))
+    if sub == "edit":
+        edited = _settings_edit(home, scope, document, yes)
+        if edited is None:
+            _emit({"ok": True, "scope": scope, "path": str(path), "action": sub,
+                   "changed": False}); return
+        new_document = edited
+    elif sub == "put":
+        new_document = _settings_checked_put(scope, _stdin_document("the settings document"))
     elif sub == "set":
         if len(rest) < 3:
             _die(6, "input", "settings set needs a key and a value", usage)
@@ -2200,19 +2623,47 @@ def _cmd_settings(argv: list[str]) -> None:
                                      from_argv=True)
             except ValueError as e:
                 _die(6, "settings_invalid", str(e))
-        previous, _ = _settings_dig(document, key)
-        _settings_put(document, key, value)
-    else:
-        previous, found = _settings_dig(document, key)
-        if not found:
-            _die(3, "not_found", f"{key} is not set at scope {scope}")
-        _settings_drop(document, key)
-    _settings_write(home, path, document)
     out = {"ok": True, "scope": scope, "path": str(path), "action": sub}
-    if key:
-        out.update({"key": key, "previous": previous})
-        if sub == "set":
-            out["value"] = _settings_dig(document, key)[0]
+    if rows:
+        def change(target: dict) -> dict:
+            if sub in ("put", "edit"):
+                return new_document
+            if sub == "set":
+                _settings_put(target, key, value)
+                return target
+            if not _settings_dig(target, key)[1]:
+                raise StoreError("not_found", f"{key} is not set at scope {scope}")
+            _settings_drop(target, key)
+            return target
+        written = _settings_rows_write(home, scope, change)
+        out["path"] = written["source"]
+        if key:
+            out.update({"key": key, "previous": _settings_dig(written["before"], key)[0]})
+            if sub == "set":
+                out["value"] = _settings_dig(written["after"], key)[0]
+        if sub == "edit":
+            out["changed"] = True
+        out["generation"] = written["generation"]
+        if written.get("node"):
+            out["node"] = written["node"]
+    else:
+        if sub in ("put", "edit"):
+            document = new_document
+        elif sub == "set":
+            previous, _ = _settings_dig(document, key)
+            _settings_put(document, key, value)
+        else:
+            previous, found = _settings_dig(document, key)
+            if not found:
+                _die(3, "not_found", f"{key} is not set at scope {scope}")
+            _settings_drop(document, key)
+        _settings_write(home, path, document)
+        if key:
+            out.update({"key": key, "previous": previous})
+            if sub == "set":
+                out["value"] = _settings_dig(document, key)[0]
+        if sub == "edit":
+            out["changed"] = True
     applies = (decl or {}).get("apply") or home.get("apply")
     if applies:
         out["apply"] = applies
@@ -2235,6 +2686,8 @@ def _contract(argv: list[str]) -> None:
         _emit(f"{SUMMARY} Run `{NAME} help`.")
     elif cmd == "manifest":
         _emit(_manifest_core())
+    elif cmd == "migrate" and argv[1:2] == ["files"]:
+        _cmd_migrate_files(argv[2:])
     elif cmd == "migrate" and _tables_declared():
         _cmd_migrate(argv[1:])
     elif cmd == "guide":
