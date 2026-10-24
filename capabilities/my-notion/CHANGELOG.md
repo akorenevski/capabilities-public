@@ -1,5 +1,9 @@
 # my-notion — change log
 
+## 2026-10-24 — Binds the contract library by range
+
+The script declares `capabilities-contract>=0.8,<1` and binds the core, store and connections tiers with `_contract_bind(globals(), ...)` in place of the stamped contract regions and the exact `==0.5.1` pin, which the 2026-10-24 manager refuses at install, update and audit. The library runs each tier in the script's namespace as the stamped text did; install and update bring it to the newest release in the range. Domain verbs are unchanged.
+
 ## 2026-10-19 — Pins the contract library the regions need
 
 The script header pins `capabilities-contract==0.5.1`, the library the restamped contract regions are written for. The 2026-10-19 contract sync stamped regions that call `connect(transaction=True)` but left the header on 0.4.1, so every command, `doctor` included, failed with `TypeError: connect() got an unexpected keyword argument 'transaction'` in a store-connected project.

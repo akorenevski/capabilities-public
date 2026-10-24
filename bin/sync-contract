@@ -1,71 +1,69 @@
 #!/usr/bin/env bash
-# Stamp contract/preamble.py into every capabilities/*/bin/* fenced region.
+# Bring every capabilities/*/bin/* script to the manager's contract form.
 #
-# Why this wrapper exists: `capabilities sync-contract` resolves the source tree
-# from the location of the manager SCRIPT (_MANAGER_DIR.parent), not from the
-# working directory. Run from a source workspace created by `capabilities source
-# init`, it therefore looks for capabilities/ next to the installed manager
-# (~/.capabilities/capabilities) and exits 5 "no_source". `source init` vendors
-# contract/preamble.py but leaves no way to apply it.
+# The shared code is the capabilities-contract library's, bound by a version
+# range (manager change log 2026-10-21): a script declares the library in its
+# PEP 723 header by the range the installed manager supports and binds each tier
+# it carries with `_contract_bind(globals(), "<tier>")`. The manager's own
+# `sync-contract` is gone, and install, update and audit refuse an exact pin
+# older than the range or a script that still carries the stamped regions
+# instead of the binds. This wrapper rewrites both: each stamped
+# `# >>> contract: <tier>` region becomes its bind call (the library executes
+# the tier in place, as the stamped text ran), and the declared library becomes
+# the manager's range.
 #
-# The fix is to make the manager execute from inside this workspace. A permanent
-# vendored copy would be a second manager free to drift from the installed one,
-# so the copy is transient: taken fresh on each run, removed on exit.
-#
-# Usage: bin/sync-contract [--check]
+# Usage: bin/sync-contract [--check]   (--check: report drift, exit 7, write nothing)
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 manager="$(readlink -f "$(command -v capabilities)")"
 
-if [[ ! -f "$root/contract/preamble.py" ]]; then
-  echo "no contract/preamble.py under $root — not a source workspace" >&2
-  exit 5
-fi
-
-staging="$root/.sync-contract-run"
-trap 'rm -rf "$staging"' EXIT
-mkdir -p "$staging"
-cp "$manager" "$staging/capabilities"
-chmod +x "$staging/capabilities"
-
-# _MANAGER_DIR=$staging -> _REPO_ROOT=$root -> src=$root/capabilities
-"$staging/capabilities" sync-contract "$@"
-
-# The stamped regions call the shared database library, but `sync-contract`
-# leaves each script's PEP-723 header alone, so a resync can run new region code
-# against an old pin, or against none (2026-10-19: my-notion on 0.4.1 broke on
-# `connect(transaction=...)`; a private capability had no pin at all). The
-# installed manager's own header pins the version its contract was written for:
-# align every script that imports the library to it.
 python3 - "$manager" "$root" "$@" <<'PY'
 import json, pathlib, re, sys
-manager, root, args = sys.argv[1], pathlib.Path(sys.argv[2]), sys.argv[3:]
+manager, root, args = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3:]
 check = "--check" in args
-pin_re = re.compile(r'"capabilities-contract==[^"]*"')
-want = pin_re.search(pathlib.Path(manager).read_text()).group(0)
-drift = []
+lib = "capabilities-contract"
+want_range = re.search(r'^CONTRACT_LIBRARY_RANGE = "([^"]+)"$', manager.read_text(), re.M).group(1)
+want = f'"{lib}{want_range}"'
+dep_re = re.compile(r'"capabilities-contract(?:[<>=!~][^"]*)?"')
+tiers = {"capability core": "core", "store": "store", "connections": "connections"}
+region_re = re.compile(r"^# >>> contract: (capability core|store|connections) .*?\n.*?^# <<< contract: \1 <<<\n",
+                       re.M | re.S)
+import_line = "from capabilities_contract.capability import bind as _contract_bind\n"
+drift = {}
 for script in sorted(root.glob("capabilities/*/bin/*")):
-    if script.name != script.parent.parent.name or not script.is_file():
+    name = script.parent.parent.name
+    if script.name != name or not script.is_file():
         continue
-    text = script.read_text()
-    if "from capabilities_contract import db" not in text:
-        continue
-    meta = re.search(r"^# /// script\n(.*?)^# ///$", text, re.M | re.S)
+    text = new = script.read_text()
+    first = True
+    def bind(m):
+        global first
+        call = f'_contract_bind(globals(), "{tiers[m.group(1)]}")\n'
+        if first and import_line not in new:
+            first = False
+            return ("# The shared capability code is the capabilities-contract library's, bound here\n"
+                    "# into this script's namespace (SHEBANG.md, \"The contract verbs\").\n"
+                    + import_line + "\n" + call)
+        first = False
+        return call
+    new = region_re.sub(bind, new)
+    meta = re.search(r"^# /// script\n(.*?)^# ///$", new, re.M | re.S)
     if not meta:
-        drift.append(script.parent.parent.name)
+        drift[name] = "no PEP 723 block"
         continue
     block = meta.group(1)
-    if pin_re.search(block):
-        new_block = pin_re.sub(want, block)
+    if dep_re.search(block):
+        new_block = dep_re.sub(want, block)
     elif "# dependencies = [\n" in block:
         new_block = block.replace("# dependencies = [\n", f"# dependencies = [\n#     {want},\n", 1)
     else:
         new_block = block + f"# dependencies = [\n#     {want},\n# ]\n"
-    if new_block != block:
-        drift.append(script.parent.parent.name)
+    new = new[:meta.start(1)] + new_block + new[meta.end(1):]
+    if new != text:
+        drift[name] = "rewritten" if not check else "behind"
         if not check:
-            script.write_text(text[:meta.start(1)] + new_block + text[meta.end(1):])
-print(json.dumps({"contract_pin": want.strip('"'), "pin_drift" if check else "pinned": drift}))
+            script.write_text(new)
+print(json.dumps({"contract_range": f"{lib}{want_range}", "drift" if check else "rewritten": sorted(drift)}))
 sys.exit(7 if check and drift else 0)
 PY
