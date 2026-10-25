@@ -1,6 +1,6 @@
 # my-notion — origin
 
-`my-notion` is an independent capability. Its first version, on 2026-08-10, started from the `notion` capability in the public `ai-cluster-one/capabilities` catalogue. Everything since is ours, and the two have diverged well past the point where a merge would mean anything.
+`my-notion` is an independent capability by Alexander Korenevski, under the MIT licence. Its first version, on 2026-08-10, started from the `notion` capability by Konstantin Žilin in the public `ai-cluster-one/capabilities` catalogue, under the MIT licence. Everything since is ours, and the two have diverged well past the point where a merge would mean anything.
 
 Measured 2026-09-07 against that catalogue's `notion`: 448 of our 4692 lines survived verbatim from the 1056-line base, about 9% of the file, and we carried 29 `cmd_*` handlers against its 7. The additions are the database, view, user, comment, attachment and archive surfaces, plus the `2026-03-11` data-source API pin.
 

@@ -13,6 +13,10 @@ This tool is designed to be invoked by agents. Run `my-notion help` to load
 the full usage contract on demand — do not rely on memorised knowledge of
 its surface.
 
+Author: Alexander Korenevski. MIT licence. Its first version started from the
+`notion` capability by Konstantin Žilin in ai-cluster-one/capabilities (MIT);
+it is an independent capability, not a fork (PROVENANCE.md).
+
 CONNECTIONS
   Configuration resolves as named connections, one per Notion workspace,
   declared in an explicit registry. Declare them through the manager, from

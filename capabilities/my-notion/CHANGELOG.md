@@ -1,5 +1,9 @@
 # my-notion — change log
 
+## 2026-10-25 — Names its authors
+
+Alexander Korenevski is named as the author (the CLI's header, `README.md`, `PROVENANCE.md`), and Konstantin Žilin as the author of the `notion` capability its first version started from. It stays an independent capability, not a fork. Domain verbs are unchanged.
+
 ## 2026-10-24 — Binds the contract library by range
 
 The script declares `capabilities-contract>=0.8,<1` and binds the core, store and connections tiers with `_contract_bind(globals(), ...)` in place of the stamped contract regions and the exact `==0.5.1` pin, which the 2026-10-24 manager refuses at install, update and audit. The library runs each tier in the script's namespace as the stamped text did; install and update bring it to the newest release in the range. Domain verbs are unchanged.

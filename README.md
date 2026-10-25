@@ -13,7 +13,7 @@ This repository runs on two open tools by Konstantin Žilin and [Cluster One](ht
 
 | Capability | What it does |
 |---|---|
-| [`my-notion`](capabilities/my-notion) | Notion over the REST API: pages and databases. Publish markdown, create and upsert pages; create databases, add, query and update rows on the 2026-03-11 data-source model; views, users, comments, attachments and archive. Several workspaces through named connections. |
+| [`my-notion`](capabilities/my-notion) | Notion over the REST API: pages and databases. Publish markdown, create and upsert pages; create databases, add, query and update rows on the 2026-03-11 data-source model; views, users, comments, attachments and archive. Several workspaces through named connections. Its first version started from Konstantin Žilin's `notion` (MIT). |
 | [`telegram-bot`](capabilities/telegram-bot) | One Telegram bot per project: the project's agent answers in allowed chats and forum topics when addressed, with a bot-to-bot loop guard. Bot API; derived from the `telegram` capability of [ai-cluster-one/capabilities](https://github.com/ai-cluster-one/capabilities) (MIT, Cluster One). |
 
 ## Install
