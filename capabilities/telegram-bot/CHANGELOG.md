@@ -1,5 +1,10 @@
 # telegram-bot — change log
 
+## 0.7.4 — 2026-10-25
+
+- A `=== REPLY ===` marker with nothing under it is silence: nothing is sent, and text above the marker is never sent in any case. Live in a forum topic, a turn that decided to stay silent posted its reasoning with the bare marker. Upstream's `cut_at_reply_marker` is unchanged; the daemon drops its `mislabelled` result.
+- The context template says a silence is never explained. A project whose `context` prompt is already in the store keeps its version until it is put again (`prompts put`).
+
 ## 0.7.3 — 2026-10-25
 
 - Konstantin Žilin is named as the author of the upstream `telegram` capability (the CLI's header and `README.md`); upstream's MIT notice (`LICENSE-UPSTREAM`, copyright Cluster One) and `UPSTREAM.md` are unchanged. Behaviour is unchanged.

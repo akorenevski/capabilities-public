@@ -1597,6 +1597,10 @@ class Service:
                                 self.failure_notice(decision, result.get("kind") or "error"),
                                 markdown=False)
         answer, outcome = prompting.cut_at_reply_marker(result.get("answer") or "")
+        if outcome == "mislabelled":
+            # Unlike upstream, a marker with nothing under it is silence: what
+            # stands above a marker is working-out and never reaches the chat.
+            answer = ""
         log(f"{key} #{decision['message_id']}: {name} answered in {seconds}s ({outcome}"
             + (", restricted" if restricted else "") + ")")
         if not answer.strip():

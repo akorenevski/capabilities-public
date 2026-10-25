@@ -9,7 +9,8 @@ bot; with privacy mode off (or as an admin) it is the whole room.
 The prompt follows upstream `telegram`'s `build_prompt` in shape - the
 project's context file, the channel state, the current request, then the
 conversation - trimmed to what a bot knows. The reply marker and its cut are
-upstream's (`REPLY_MARKER_LINE`, `cut_at_reply_marker`), carried unchanged.
+upstream's (`REPLY_MARKER_LINE`, `cut_at_reply_marker`), carried unchanged; the
+daemon, unlike upstream, sends nothing for a marker with nothing under it.
 
 Message text is the one part of the prompt a stranger writes, so it is fenced
 as upstream fences it: a line opening with `---` is indented (`_quoted`), so a

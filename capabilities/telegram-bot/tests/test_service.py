@@ -119,6 +119,15 @@ class Turns(unittest.TestCase):
         self.assertIn("--- Current request ---", seen["prompt"])
         self.assertEqual(api.sent[-1]["text"], "all green")
 
+    def test_marker_with_nothing_under_it_is_silence(self):
+        # Live, 0.7.3: the reasoning above an empty marker was posted whole.
+        answer = ("S0L0M0N only confirms, so I send nothing to the chat.\n"
+                  "=== REPLY ===\n  \n")
+        s, api = service(worker=lambda *a: {"ok": True, "answer": answer,
+                                            "kind": None, "reason": None})
+        s.handle_update(update(addressed("ok?")))
+        self.assertEqual(api.sent, [])
+
     def test_redelivered_update_is_answered_once(self):
         s, api = service()
         u = update(addressed())
