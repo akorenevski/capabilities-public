@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""Carry a new upstream release onto a capability derived from one.
+
+Usage: bin/carry-upstream <capability> [--ref REF] [--apply [--reviewed]]
+
+Reads the JSON block of capabilities/<capability>/UPSTREAM.md (upstream URL,
+path, recorded commit, verbatim files with their sha256, adapted files with the
+upstream files each was adapted from), fetches upstream at REF (default main; a
+branch, a tag or a commit) into a scratch clone, and answers one JSON object:
+
+  verbatim_changed   verbatim files upstream changed since the recorded commit
+  adapted_to_review  adapted files whose upstream origin changed, each with the
+                     origin's diff stat; each origin's diff is printed to
+                     stderr once, naming the files adapted from it
+  missing_modules    files a verbatim file loads by path (`HERE / "x.py"`)
+                     that this capability does not carry
+  tests              the suite's result (run under --apply)
+  needs_person       a one-line note for whoever carries it, or null
+
+With --apply, verbatim files are copied over ours byte for byte and their
+hashes (of upstream's blobs) rewritten in UPSTREAM.md, and the capability's
+tests run under uv with what the suite needs (TEST_RUNNER). The recorded commit
+moves only when no adapted origin is left to review: otherwise the block keeps
+the old commit and records `pending` (the new commit and the adapted files to
+review), so the next run shows the same diffs again; `--reviewed`, given once
+they are carried, moves the commit and clears `pending`. The exit is 0 when the
+carry is clean, 1 when the tests fail or cannot run or a module is missing, 6
+on bad input. It never commits, pushes, releases or sends anything, and nothing
+schedules it: wiring it to a timer and the note to a sender is a later step.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+BLOCK = re.compile(r"```json\n(.*?)\n```", re.S)
+# The capability suite's runner: pytest, the capabilities-contract library the
+# CLI tests load the CLI with, and the harness runner the daemon pins, which
+# the tests that resolve real profiles import.
+TEST_RUNNER = ["run", "--quiet", "--with", "pytest", "--with", "capabilities-contract>=0.18,<1",
+               "--with", "httpx>=0.27", "--with", "callva-harness-runner==0.10.1",
+               "python", "-m", "pytest", "-q", "-p", "no:cacheprovider"]
+
+
+def git(*args, cwd=None) -> str:
+    return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True,
+                          text=True).stdout
+
+
+def blob(ref_path: str, cwd) -> bytes:
+    """A file at a commit exactly as git holds it: no newline translation."""
+    return subprocess.run(["git", "cat-file", "blob", ref_path], cwd=cwd, check=True,
+                          capture_output=True).stdout
+
+
+def resolve_ref(ref: str, clone) -> str:
+    """REF as a branch of the remote, else a tag or a commit."""
+    for candidate in (f"origin/{ref}", f"{ref}^{{commit}}"):
+        done = subprocess.run(["git", "rev-parse", "--verify", "--quiet", candidate], cwd=clone,
+                              capture_output=True, text=True)
+        if done.returncode == 0:
+            return done.stdout.strip()
+    raise SystemExit(f"carry-upstream: {ref!r} is no branch, tag or commit upstream")
+
+
+LOADED_BY_PATH = re.compile(r'HERE\s*/\s*"([\w.-]+\.py)"')
+
+
+def missing_modules(cap: Path, bodies: dict) -> list[str]:
+    """Files a verbatim file loads by path that the capability does not carry:
+    `bodies` maps each verbatim file to the text it will have."""
+    out = []
+    for ours, body in bodies.items():
+        if not ours.endswith(".py"):
+            continue
+        for name in LOADED_BY_PATH.findall(body):
+            rel = str(Path(ours).parent / name)
+            if not (cap / rel).is_file() and rel not in bodies and rel not in out:
+                out.append(rel)
+    return out
+
+
+def run_tests(cap: Path) -> dict:
+    uv = shutil.which("uv")
+    if uv is None:
+        return {"ok": False, "summary": "uv is not on PATH, so the suite did not run"}
+    done = subprocess.run([uv, *TEST_RUNNER, str(cap / "tests")], cwd=cap,
+                          capture_output=True, text=True)
+    lines = (done.stdout.strip() or done.stderr.strip()).splitlines()
+    return {"ok": done.returncode == 0, "summary": lines[-1] if lines else
+            f"the runner exited {done.returncode} and said nothing"}
+
+
+def main(argv: list[str]) -> int:
+    if not argv or argv[0].startswith("-"):
+        sys.stderr.write(__doc__)
+        return 6
+    name, ref, apply = argv[0], "main", "--apply" in argv
+    reviewed = "--reviewed" in argv
+    if "--ref" in argv:
+        ref = argv[argv.index("--ref") + 1]
+    cap = ROOT / "capabilities" / name
+    upstream_md = cap / "UPSTREAM.md"
+    text = upstream_md.read_text()
+    record = json.loads(BLOCK.search(text).group(1))
+    old = record["commit"]
+    with tempfile.TemporaryDirectory(prefix="carry-upstream-") as scratch:
+        clone = Path(scratch) / "upstream"
+        git("clone", "--quiet", "--filter=blob:none", "--no-checkout", record["upstream"],
+            str(clone))
+        new = resolve_ref(ref, clone)
+        if new == old:
+            missing = missing_modules(cap, {ours: (cap / ours).read_text(errors="replace")
+                                            for ours in record["verbatim"]})
+            print(json.dumps({"capability": name, "commit": old, "up_to_date": True,
+                              "missing_modules": missing}))
+            return 1 if missing else 0
+        base = record["path"].rstrip("/")
+        changed = set(git("diff", "--name-only", old, new, "--", base, cwd=clone).split())
+        rel = lambda p: f"{base}/{p}"  # noqa: E731
+        verbatim_changed = [ours for ours in record["verbatim"] if rel(ours) in changed]
+        adapted, feeds = {}, {}
+        for ours, origins in record["adapted"].items():
+            moved = [o for o in origins if rel(o) in changed]
+            if moved:
+                adapted[ours] = git("diff", "--stat", old, new, "--",
+                                    *[rel(o) for o in moved], cwd=clone).strip()
+                for origin in moved:
+                    feeds.setdefault(origin, []).append(ours)
+        for origin, ours_list in feeds.items():
+            sys.stderr.write(f"### upstream {origin}, adapted into: {', '.join(ours_list)}\n")
+            sys.stderr.write(git("diff", old, new, "--", rel(origin), cwd=clone))
+        bodies = {ours: (blob(f"{new}:{rel(ours)}", clone) if ours in verbatim_changed
+                         else (cap / ours).read_bytes()).decode(errors="replace")
+                  for ours in record["verbatim"]}
+        missing = missing_modules(cap, bodies)
+        tests = None
+        moved_commit = False
+        if apply:
+            for ours in verbatim_changed:
+                body = blob(f"{new}:{rel(ours)}", clone)
+                (cap / ours).write_bytes(body)
+                record["verbatim"][ours] = hashlib.sha256(body).hexdigest()
+            if adapted and not reviewed:
+                # The old commit stays, so the next run shows these diffs again.
+                record["pending"] = {"commit": new, "adapted": sorted(adapted)}
+            else:
+                record["commit"] = new
+                record.pop("pending", None)
+                moved_commit = True
+            upstream_md.write_text(BLOCK.sub("```json\n" + json.dumps(record, indent=2)
+                                             + "\n```", text, count=1))
+            if moved_commit:
+                upstream_md.write_text(upstream_md.read_text().replace(old, new))
+            tests = run_tests(cap)
+    note = None
+    if adapted or missing or (tests is not None and not tests["ok"]):
+        parts = []
+        if adapted:
+            parts.append(f"{len(adapted)} adapted file(s) to review"
+                         + ("" if moved_commit or not apply else
+                            ", recorded as pending; the commit stays until --reviewed"))
+        if missing:
+            parts.append(f"missing module(s) {', '.join(missing)}")
+        if tests is not None and not tests["ok"]:
+            parts.append("tests fail")
+        done = ("carried" if moved_commit else "applied, the recorded commit kept" if apply
+                else "not applied (no --apply)")
+        note = f"{name}: upstream {old[:7]}..{new[:7]} {done}, with {', '.join(parts)}."
+    print(json.dumps({"capability": name, "from": old, "to": new, "applied": apply,
+                      "commit_moved": moved_commit,
+                      "verbatim_changed": verbatim_changed, "adapted_to_review": adapted,
+                      "missing_modules": missing,
+                      "tests": tests, "needs_person": note}, indent=2))
+    return 1 if missing or (tests is not None and not tests["ok"]) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

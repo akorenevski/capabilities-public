@@ -1,0 +1,1510 @@
+"""The job register — the ledger of work that outlives the sentence that asked for it.
+
+Two classes of work run in this service and they are not the same thing. A
+conversation is answered while the person is still there, so its unit is the
+message and its record is the watermark register in `register.json`. A task
+outlives its sentence: the person who asked has gone back to talking, the work
+has minutes or hours left, and a correction arriving meanwhile is an amendment
+to work already in flight rather than a second request. That second class is
+what this module records.
+
+The project's database is the home, not a private one beside it: the
+capability owns its `telegram_*` tables there and migrates them itself, through
+the shared database library and under its own ledger, and nothing else knows
+these columns. The reason it is a table rather than a JSON blob is that the
+runner filters on `project_id`, `environment`, `surface` and `state` on every
+tick.
+
+WHAT THE REGISTER HOLDS, AND WHAT IT REFUSES TO HOLD
+===================================================
+The trajectory stays in the engine's own rollout, named by `session_id`; the
+register does not copy it. It does durably hold the two payloads which have not
+yet reached that rollout or Telegram: user amendments until engine acceptance,
+and the final result until delivery. What the job row adds is what the session
+cannot answer: whose authority the work carries, which channel it reports into,
+how long it waited for a slot, who owns the current attempt, and why it stopped.
+
+ONE WAY TO STOP, ONE WAY TO CONTINUE
+====================================
+Every stop is continuable, because the session is the checkpoint: a rollout of
+a job killed mid-turn holds everything the turn had established. So there is no
+state a job cannot come back from, and therefore no second halt verb for the
+stop that is meant to be final. What a caller decides is not whether the work
+can return — it always can — but whether anybody asks it to. `outcome` records
+why it stopped; `resume` is how it comes back, from any of them.
+
+AMENDMENT KEEPS THE ROW
+=======================
+Stopping a job and continuing its session with added context is one task, not
+two. The identity is stable across every amendment, `amendments` counts them,
+and the added text stays in the session where it already is. That is also why
+there is no `parent_id`: an amendment has no lineage to record.
+
+ISOLATION IS A CORRECTNESS CONDITION
+====================================
+Every queue read is filtered by `project_id` and `environment`. The store is
+shared — by two projects on one machine, and by two machines on one project —
+so a query that forgets whose work it is asking about answers with somebody
+else's. It cannot therefore be a `WHERE` clause each caller is trusted to
+remember, which is the whole reason `JobRegister` exists as a boundary.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Callable, Sequence
+from uuid import uuid4
+
+
+# How `channel_key` spells a forum topic. The column is written by whoever
+# registers a job and read back by the daemon that has to find the channel
+# again, so the spelling belongs to the register rather than to either side of
+# it: a key that does not round-trip is a finished job whose answer has nowhere
+# to go, and nothing about the row itself says it is unreachable.
+CHANNEL_TOPIC_MARKER = "#topic:"
+
+
+def channel_key(chat_id: Any, topic_id: Any = None) -> str:
+    """The key for one channel: a chat, or one forum topic inside it."""
+    base = str(chat_id)
+    if topic_id is None:
+        return base
+    return f"{base}{CHANNEL_TOPIC_MARKER}{int(topic_id)}"
+
+
+def channel_identity(key: Any) -> tuple[str, int | None]:
+    """The chat and topic a key names. A key naming no topic answers with the
+    chat alone, and so does one whose topic is not a number — reading it as a
+    chat is what every caller already does with the first half."""
+    raw = str(key)
+    if CHANNEL_TOPIC_MARKER not in raw:
+        return raw, None
+    chat_id, topic = raw.rsplit(CHANNEL_TOPIC_MARKER, 1)
+    try:
+        return chat_id, int(topic)
+    except (TypeError, ValueError):
+        return raw, None
+
+
+# How the owner of an attempt outside the runner's budget is spelled. Work a
+# person starts on a call is recorded here like any other job, but it starts the
+# moment it is asked for rather than waiting for one of `max_parallel_jobs`. Its
+# attempt still has a lease and a slot row, numbered below zero where no runner
+# counts it, so every version of the register fences, renews and stops it the way
+# it does any attempt. The spelling belongs to the register for the reason the
+# topic marker does: the reconciler that fences the attempt after a restart is not
+# the process that started it, and the owner column is all it has to tell the two
+# kinds of attempt apart.
+DIRECT_OWNER_MARKER = "#direct"
+
+
+def direct_owner(owner_id: str) -> str:
+    """The owner id an attempt outside the runner's budget runs under."""
+    return f"{owner_id}{DIRECT_OWNER_MARKER}"
+
+
+def holds_slot(owner_id: Any) -> bool:
+    """Whether an attempt owned by this id holds one of the runner's slots."""
+    return not str(owner_id or "").endswith(DIRECT_OWNER_MARKER)
+
+# The register's tables, owned by this capability in the project's database and
+# migrated through the shared database library under the owner `telegram`: each
+# step is applied once and recorded in that owner's ledger, and never edited once
+# released - a change is a new step. The columns are the ones the register has
+# always kept: a timestamp is TEXT holding an ISO instant and a flag is INTEGER,
+# so every comparison and every reader below sees the values it always saw.
+STORE_OWNER = "telegram"
+STORE_SCHEMA_MAJOR = 1
+STORE_SCHEMA_MINOR = 2
+STORE_STEPS = (
+    ("0001-jobs", """
+    CREATE TABLE telegram_jobs (
+        id                        TEXT PRIMARY KEY,
+        project_id                TEXT NOT NULL,
+        environment               TEXT NOT NULL,
+        surface                   TEXT NOT NULL,
+        channel_key               TEXT NOT NULL,
+        requested_by              TEXT NOT NULL,
+        origin_message_id         TEXT,
+        description               TEXT NOT NULL,
+        engine                    TEXT NOT NULL,
+        model                     TEXT,
+        session_id                TEXT,
+        pid                       INTEGER,
+        state                     TEXT NOT NULL,
+        outcome                   TEXT,
+        attempt                   INTEGER NOT NULL DEFAULT 0,
+        amendments                INTEGER NOT NULL DEFAULT 0,
+        stop_requested            INTEGER NOT NULL DEFAULT 0,
+        exit_code                 INTEGER,
+        error                     TEXT,
+        log_path                  TEXT,
+        created_at                TEXT NOT NULL,
+        started_at                TEXT,
+        finished_at               TEXT,
+        updated_at                TEXT NOT NULL,
+        attempt_token             TEXT,
+        lease_owner               TEXT,
+        lease_expires_at          TEXT,
+        owner_host                TEXT,
+        pgid                      INTEGER,
+        resume_at                 TEXT,
+        result_text               TEXT,
+        result_silent             INTEGER NOT NULL DEFAULT 0,
+        execution_finished_at     TEXT,
+        delivery_state            TEXT,
+        delivery_attempts         INTEGER NOT NULL DEFAULT 0,
+        delivery_error            TEXT,
+        delivered_at              TEXT,
+        delivery_owner            TEXT,
+        delivery_token            TEXT,
+        delivery_lease_expires_at TEXT
+    );
+    -- How the runner selects the next job.
+    CREATE INDEX telegram_jobs_queue_idx
+        ON telegram_jobs (project_id, environment, surface, state);
+    -- How a caller lists the open jobs of one channel.
+    CREATE INDEX telegram_jobs_channel_idx
+        ON telegram_jobs (project_id, surface, channel_key, state);
+    -- Two concurrent resumes of one session cannot both enter `running`.
+    -- Sequential amendments are unaffected; only the concurrent case is
+    -- refused, and it is refused by the schema rather than by a lock somebody
+    -- has to remember to take.
+    CREATE UNIQUE INDEX telegram_jobs_live_session_idx
+        ON telegram_jobs (session_id) WHERE state = 'running';
+    -- One Telegram update registers one job, however many deliveries race.
+    CREATE UNIQUE INDEX telegram_jobs_origin_idx
+        ON telegram_jobs (project_id, environment, surface, channel_key, origin_message_id)
+        WHERE origin_message_id IS NOT NULL;
+    """),
+    ("0002-job-amendments", """
+    CREATE TABLE telegram_job_amendments (
+        id            TEXT PRIMARY KEY,
+        project_id    TEXT NOT NULL,
+        environment   TEXT NOT NULL,
+        surface       TEXT NOT NULL,
+        job_id        TEXT NOT NULL,
+        text          TEXT NOT NULL,
+        state         TEXT NOT NULL,
+        claim_token   TEXT,
+        created_at    TEXT NOT NULL,
+        claimed_at    TEXT,
+        acked_at      TEXT
+    );
+    CREATE INDEX telegram_job_amendments_pending_idx
+        ON telegram_job_amendments
+        (project_id, environment, surface, job_id, state, created_at);
+    """),
+    ("0003-job-slots", """
+    CREATE TABLE telegram_job_slots (
+        project_id       TEXT NOT NULL,
+        environment      TEXT NOT NULL,
+        surface          TEXT NOT NULL,
+        slot             INTEGER NOT NULL,
+        job_id           TEXT NOT NULL,
+        owner_id         TEXT NOT NULL,
+        attempt_token    TEXT NOT NULL,
+        lease_expires_at TEXT NOT NULL,
+        CONSTRAINT telegram_job_slots_pkey
+            PRIMARY KEY (project_id, environment, surface, slot),
+        CONSTRAINT telegram_job_slots_job_key
+            UNIQUE (project_id, environment, surface, job_id)
+    );
+    """),
+    # The harness profile a job runs on, pinned at registration from the
+    # profile the registering turn ran on. Nullable: a row registered before
+    # rooms named profiles has none and runs on `telegram-<engine>`. `engine`
+    # stays the harness, because a session continues only on its own harness.
+    ("0004-job-profile", """
+    ALTER TABLE telegram_jobs ADD COLUMN profile TEXT;
+    """),
+    # The service's own prompts (`prompts.py`), one row per saved version. They
+    # follow the store's versioning pattern rather than the register's legacy
+    # column types: a uuid per version, timestamptz, one active version per key
+    # held by a partial unique index, and a guard that keeps every version as it
+    # was saved but for clearing `active`.
+    ("0005-prompts", """
+    CREATE TABLE telegram_prompts (
+        id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        project_id  text NOT NULL CHECK (project_id <> ''),
+        key         text NOT NULL CHECK (key ~ '^[^/[:space:]]+$' AND key !~ '^reference[.]'),
+        body        text NOT NULL,
+        active      boolean NOT NULL DEFAULT true,
+        created_at  timestamptz NOT NULL DEFAULT now(),
+        created_by  text NOT NULL CHECK (created_by <> ''),
+        note        text
+    );
+    CREATE UNIQUE INDEX telegram_prompts_active ON telegram_prompts (project_id, key)
+        WHERE active;
+    CREATE INDEX telegram_prompts_key ON telegram_prompts (project_id, key, created_at DESC);
+    COMMENT ON TABLE telegram_prompts IS
+        'Every saved version of a telegram service prompt; immutable but for active, which a save clears as it adds the next.';
+    COMMENT ON COLUMN telegram_prompts.project_id IS
+        'The project''s declared id.';
+    COMMENT ON COLUMN telegram_prompts.key IS
+        'The document key: the service file''s name without .md, lower-cased with _ as -, prefixed context. for a file in context/.';
+    COMMENT ON COLUMN telegram_prompts.body IS
+        'The prompt''s whole text, kept exactly.';
+    COMMENT ON COLUMN telegram_prompts.active IS
+        'The version the service reads; at most one per project and key.';
+    COMMENT ON COLUMN telegram_prompts.created_by IS
+        'Who saved the version: user@node, or the verb that seeded it.';
+    COMMENT ON COLUMN telegram_prompts.note IS
+        'Why the version was saved.';
+    CREATE FUNCTION telegram_prompts_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        IF tg_op IN ('DELETE', 'TRUNCATE') THEN
+            RAISE EXCEPTION 'telegram prompt versions are never deleted: save a new version'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        IF (to_jsonb(new) - 'active') IS DISTINCT FROM (to_jsonb(old) - 'active') THEN
+            RAISE EXCEPTION 'a telegram prompt version is immutable: save a new version'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        IF new.active AND NOT old.active THEN
+            RAISE EXCEPTION 'a telegram prompt version is not made active again: save its text as a new version'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN new;
+    END $$;
+    CREATE TRIGGER telegram_prompts_guard BEFORE UPDATE OR DELETE ON telegram_prompts
+        FOR EACH ROW EXECUTE FUNCTION telegram_prompts_guard();
+    CREATE TRIGGER telegram_prompts_truncate BEFORE TRUNCATE ON telegram_prompts
+        FOR EACH STATEMENT EXECUTE FUNCTION telegram_prompts_guard();
+    """),
+)
+
+# The harness runner's profile table lives in the same store, under the
+# runner's own ledger, and is applied before the register's steps wherever the
+# daemon opens the register. The steps are the runner's: a process that has the
+# runner imports them, and one that does not asks the bundle's profiles module,
+# whose header pins it, once.
+_PROFILE_STORE_STEPS: dict | None = None
+
+
+def profile_store_steps() -> dict:
+    """The runner's profile-table steps as `{owner, steps, major, minor}`."""
+    global _PROFILE_STORE_STEPS
+    if _PROFILE_STORE_STEPS is not None:
+        return _PROFILE_STORE_STEPS
+    try:
+        from callva import harness_runner as lib
+    except ImportError:
+        lib = None
+    if lib is not None:
+        found = {"owner": lib.PROFILE_STORE_OWNER,
+                 "steps": [list(step) for step in lib.PROFILE_STORE_STEPS],
+                 "major": lib.PROFILE_STORE_MAJOR, "minor": lib.PROFILE_STORE_MINOR}
+    else:
+        script = Path(__file__).resolve().parent / "profiles.py"
+        uv = shutil.which("uv")
+        if uv is None:
+            raise JobError("harness_runner_unavailable",
+                           "uv is not on PATH, so the harness runner's profile table "
+                           "cannot be resolved",
+                           "install uv, which runs every telegram script")
+        try:
+            done = subprocess.run([uv, "run", "--quiet", "--script", str(script),
+                                   "store-steps"], capture_output=True, text=True,
+                                  timeout=600)
+            found = json.loads(done.stdout) if done.returncode == 0 else None
+        except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+            done, found = None, None
+            detail = str(exc)
+        if found is None:
+            detail = (done.stderr.strip() if done is not None else detail) or "no answer"
+            raise JobError("harness_runner_unavailable",
+                           f"the harness runner's profile table could not be resolved "
+                           f"from {script}: {detail}",
+                           "`telegram migrate` resolves the runner and applies it")
+    _PROFILE_STORE_STEPS = found
+    return found
+
+# WHAT A JOB IS DOING, AND WHY IT IS DOING THAT
+# =============================================
+# Two columns, because they answer two questions and only one of them changes
+# what anything does.
+#
+# `state` is the whole of the runner's interest: a job is waiting for a slot,
+# holding one, or holding nothing. Nothing else is a state, because nothing
+# else changes what may happen next — the session is the checkpoint, so work
+# that stopped for any reason at all can be continued from where it stopped,
+# and a job that never started resumes by starting. There is deliberately no
+# `finished`: it would differ from `stopped` only in the label, and a label
+# that never changes behaviour belongs in the column for labels.
+#
+# `outcome` is that label — why the job is stopped. It earns its values by
+# them behaving differently: `quota` is resumed by the runner when the pause
+# lifts, `interrupted` by the configured recovery policy, and the rest only by
+# somebody asking. `model_refused` is the one that answers a resume the same
+# way it answered the run, because the binary refused the model rather than the
+# work — asking again without changing the setting spends another attempt on a
+# refusal already given. It says nothing while the job is waiting or running.
+# A job is written before it is handed over. `draft` is that gap made explicit:
+# the row exists, so a description can be corrected and material added to it,
+# and no runner will take it, because the runner claims `waiting` and nothing
+# else. Submitting is the single act that ends the writing and begins the work.
+DRAFT = "draft"
+WAITING = "waiting"
+RUNNING = "running"
+STOPPED = "stopped"
+STATES = (DRAFT, WAITING, RUNNING, STOPPED)
+
+SUCCEEDED = "succeeded"
+FAILED = "failed"
+CANCELLED = "cancelled"
+INTERRUPTED = "interrupted"
+QUOTA = "quota"
+MODEL_REFUSED = "model_refused"
+OUTCOMES = (SUCCEEDED, FAILED, CANCELLED, INTERRUPTED, QUOTA, MODEL_REFUSED)
+
+# Resumed without being asked: one when the subscription comes back, one when
+# the daemon that was running it restarted. Every other outcome waits for a
+# person, because every other outcome is one a person chose or must read.
+SELF_RESUMING = (QUOTA, INTERRUPTED)
+
+ENGINES = ("codex", "claude", "stub")
+
+# An environment is a label a person types into settings, and it lands in a
+# query that decides whose work a runner may take. Anything ambiguous to
+# address stays out.
+ENVIRONMENT_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}", re.IGNORECASE)
+
+
+class JobError(Exception):
+    """Every failure this module reports, carrying a slug the caller maps onto
+    its own error envelope."""
+
+    def __init__(self, slug: str, message: str, hint: str | None = None):
+        super().__init__(message)
+        self.slug = slug
+        self.message = message
+        self.hint = hint
+
+
+def iso() -> str:
+    """Microsecond resolution, because arrival order is the whole queue
+    discipline. At second resolution two jobs registered in the same second tie,
+    and the tiebreak falls to a uuid, which does not order — so the oldest
+    queued job stops being the one that arrived first."""
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+
+
+def handed_project_id(root: Path) -> str:
+    """The project id its launcher handed down for this root, scoped by
+    CAPABILITIES_PROJECT_ID_ROOT; one without that scope binds no folder."""
+    handed = os.environ.get("CAPABILITIES_PROJECT_ID", "").strip()
+    scope = os.environ.get("CAPABILITIES_PROJECT_ID_ROOT", "").strip()
+    if not handed or not scope:
+        return ""
+    try:
+        return handed if Path(scope).resolve() == Path(root).resolve() else ""
+    except OSError:
+        return ""
+
+
+def bound_project_id(root: Path) -> str:
+    """The project's id, CAPABILITIES_PROJECT_ID: its launcher's, as
+    `handed_project_id` reads it, else the one the project root's .env.local,
+    else its .env, sets; "" where none does."""
+    handed = handed_project_id(root)
+    if handed:
+        return handed
+    for name in (".env.local", ".env"):
+        try:
+            lines = (Path(root) / name).read_text().splitlines()
+        except OSError:
+            continue
+        found = ""  # the last line naming the key wins, as in any env file
+        for line in lines:
+            key, eq, value = line.strip().partition("=")
+            key = key.strip()
+            if key.startswith("export "):
+                key = key[len("export "):].strip()
+            if eq and key == "CAPABILITIES_PROJECT_ID":
+                found = value.strip().strip('"').strip("'")
+        if found:
+            return found
+    return ""
+
+
+def store_setting(project_root: Path | None):
+    """The database the project at `project_root` uses for runtime state, as the
+    shared database library resolves it: the project's `.env.local` / `.env`,
+    then the process environment, then the machine's store setting.
+
+    There is no local default. A register nobody else can see is a queue whose
+    work silently goes nowhere, so a project with no database is told so -
+    `store_not_configured`, with the library's hint - rather than handed one."""
+    try:
+        from capabilities_contract.db import DbError, resolve_setting
+    except ImportError as exc:
+        raise JobError("store_library_missing",
+                       "the shared database library capabilities-contract is not installed",
+                       "run the capability through its own script header, which pins it") from exc
+    try:
+        return resolve_setting(project_root)
+    except DbError as exc:
+        raise JobError(exc.slug, exc.message, exc.hint) from exc
+
+
+class JobStore:
+    """The register's connection to the store: one psycopg connection bound to
+    the setting's schema, in autocommit so that each `transaction()` is the
+    whole of a unit of work. The register writes `?` for a parameter, as it
+    always has; this is the one place that spells it for the driver."""
+
+    def __init__(self, conn):
+        self.conn = conn
+
+    def _execute(self, sql: str, params: Sequence[Any] = ()):
+        return self.conn.execute(sql.replace("?", "%s"), tuple(params))
+
+    def transaction(self):
+        return self.conn.transaction()
+
+    def close(self) -> None:
+        self.conn.close()
+
+    def lost(self) -> bool:
+        """Whether the connection is gone, so the next statement cannot succeed
+        on it whatever it is: the store or the network ended it, or it was
+        closed."""
+        return bool(self.conn.closed or self.conn.broken)
+
+
+def open_register(envelope: Path, environment: str, surface: str = "telegram",
+                  project_id: str | None = None, setting=None,
+                  project_root: Path | None = None, profile_tables: bool = True):
+    """The store this project's jobs live in, and the register onto it.
+
+    There is no file-mode register and no local database. A queue, a slot count
+    and a cancellation flag are what every process serving the project
+    coordinates through, so they live in the project's database, in this
+    capability's own tables, migrated here under its own ledger. The caller
+    closes the store.
+
+    The project id is the one the launching CLI resolved and passes in; the
+    project's own binding, as `bound_project_id` reads it at `project_root`
+    (else the envelope's parent), stands in only where no launcher resolved one.
+    `setting` is the database already resolved by a caller that reads it once;
+    otherwise it is resolved now for `project_root`. The runner's profile table
+    is migrated first unless `profile_tables` is off, as it is for a CLI verb
+    that only reads or writes jobs.
+    """
+    project_id = project_id or bound_project_id(
+        Path(project_root) if project_root else Path(envelope).parent)
+    if not project_id:
+        raise JobError("no_project_identity",
+                       f"the project under {envelope} declares no id "
+                       "(CAPABILITIES_PROJECT_ID)",
+                       "run `capabilities init` in the project")
+    if setting is None:
+        setting = store_setting(project_root)
+    from capabilities_contract.db import DbError, connect, migrate
+    try:
+        conn = connect(application_name=STORE_OWNER, setting=setting, transaction=True)
+    except DbError as exc:
+        raise JobError(exc.slug, exc.message, exc.hint) from exc
+    try:
+        if profile_tables:
+            harness = profile_store_steps()
+            migrate(conn, harness["owner"], [tuple(step) for step in harness["steps"]],
+                    major=harness["major"], minor=harness["minor"])
+        migrate(conn, STORE_OWNER, STORE_STEPS, major=STORE_SCHEMA_MAJOR,
+                minor=STORE_SCHEMA_MINOR)
+        conn.autocommit = True
+    except DbError as exc:
+        conn.close()
+        raise JobError(exc.slug, exc.message, exc.hint) from exc
+    except Exception:
+        conn.close()
+        raise
+    store = JobStore(conn)
+    return store, JobRegister(store, str(project_id), environment, surface)
+
+
+class JobRegister:
+    """Every question and every claim about jobs, in one place that knows whose.
+
+    The store is shared by every daemon and every CLI serving the project, on
+    one machine or several; the scope and the query shape do not change with
+    how many of them there are.
+    """
+
+    def __init__(self, store, project_id: str, environment: str,
+                 surface: str = "telegram"):
+        if not project_id:
+            raise JobError("no_project_scope",
+                           "the job register requires a registered project")
+        if not ENVIRONMENT_RE.fullmatch(str(environment or "")):
+            raise JobError("bad_environment",
+                           f"environment {environment!r} must match "
+                           f"{ENVIRONMENT_RE.pattern}")
+        self.store = store
+        self.project_id = project_id
+        self.environment = str(environment)
+        self.surface = str(surface)
+
+    # -- the scope, applied once ----------------------------------------------
+
+    def _where(self, *predicates: str) -> tuple[str, list]:
+        """The isolation clause every read and every write carries.
+
+        Environment is part of every ordinary lookup, including primary-key
+        reads. Cross-environment inspection belongs to an explicit operator
+        surface, never to the register workers use.
+        """
+        parts = ["project_id = ?", "surface = ?"]
+        params: list = [self.project_id, self.surface]
+        parts.append("environment = ?")
+        params.append(self.environment)
+        parts.extend(predicates)
+        return " WHERE " + " AND ".join(parts), params
+
+    @staticmethod
+    def _dicts(cursor) -> list[dict[str, Any]]:
+        """Rows as dicts without depending on a row factory: the register runs
+        against a bare store connection and, later, against a driver that has
+        no such notion at all."""
+        names = [c[0] for c in cursor.description]
+        return [dict(zip(names, row)) for row in cursor.fetchall()]
+
+    def _rows(self, predicates: str = "", params: Sequence[Any] = (),
+              order: str = "", limit: int | None = None) -> list[dict[str, Any]]:
+        clause, scope = self._where(*([predicates] if predicates else []))
+        sql = "SELECT * FROM telegram_jobs" + clause
+        if order:
+            sql += f" ORDER BY {order}"
+        args = scope + list(params)
+        if limit is not None:
+            sql += " LIMIT ?"
+            args.append(limit)
+        return self._dicts(self.store._execute(sql, tuple(args)))
+
+    @staticmethod
+    def _marks(values: Sequence[Any]) -> str:
+        return ", ".join("?" for _ in values)
+
+    # -- reads ----------------------------------------------------------------
+
+    def get(self, job_id: str, *, actor_id: str | None = None) -> dict[str, Any] | None:
+        predicates, params = ["id = ?"], [job_id]
+        if actor_id is not None:
+            predicates.append("requested_by = ?")
+            params.append(str(actor_id))
+        rows = self._rows(" AND ".join(predicates), params)
+        return rows[0] if rows else None
+
+    def list(self, *, limit: int = 50, state: str | None = None,
+             outcome: str | None = None,
+             channel_key: str | None = None,
+             actor_id: str | None = None) -> list[dict[str, Any]]:
+        predicates, params = [], []
+        if state:
+            predicates.append("state = ?")
+            params.append(state)
+        if outcome:
+            predicates.append("outcome = ?")
+            params.append(outcome)
+        if channel_key:
+            predicates.append("channel_key = ?")
+            params.append(channel_key)
+        if actor_id is not None:
+            predicates.append("requested_by = ?")
+            params.append(str(actor_id))
+        return self._rows(" AND ".join(predicates), params,
+                          order="created_at DESC, id", limit=limit)
+
+    def open_jobs(self, channel_key: str, *, actor_id: str | None = None,
+                  include_stopped: bool = False) -> list[dict[str, Any]]:
+        """What is still in flight for one channel, oldest first."""
+        states = (WAITING, RUNNING, STOPPED) if include_stopped else (WAITING, RUNNING)
+        predicates = [f"channel_key = ? AND state IN ({self._marks(states)})"]
+        params: list[Any] = [channel_key, *states]
+        if actor_id is not None:
+            predicates.append("requested_by = ?")
+            params.append(str(actor_id))
+        return self._rows(" AND ".join(predicates), params, order="created_at, id")
+
+    def next_waiting(self) -> dict[str, Any] | None:
+        """The oldest job waiting for a slot in this project and environment.
+        Arrival order, with no estimation, priority or classes of size."""
+        rows = self._rows("state = ?", (WAITING,), order="created_at, id", limit=1)
+        return rows[0] if rows else None
+
+    def active(self) -> list[dict[str, Any]]:
+        return self._rows("state = ?", (RUNNING,), order="started_at, id")
+
+    def expired_active(self) -> list[dict[str, Any]]:
+        return self._rows(
+            "state = ? AND (lease_expires_at IS NULL OR lease_expires_at <= ?)",
+            (RUNNING, iso()), order="started_at, id")
+
+    def running(self, *, actor_id: str | None = None) -> int:
+        """How many slots are in use: running work that holds one."""
+        predicates = ["state = ?", "(lease_owner IS NULL OR lease_owner NOT LIKE ?)"]
+        values: list[Any] = [RUNNING, f"%{DIRECT_OWNER_MARKER}"]
+        if actor_id is not None:
+            predicates.append("requested_by = ?")
+            values.append(str(actor_id))
+        clause, params = self._where(*predicates)
+        return self.store._execute("SELECT COUNT(*) FROM telegram_jobs" + clause,
+                                   tuple(params + values)).fetchone()[0]
+
+    def counts(self, *, actor_id: str | None = None) -> dict[str, Any]:
+        """What a person asks first: how much is moving, and how much stopped
+        for a reason worth reading."""
+        predicates: list[str] = []
+        values: list[Any] = []
+        if actor_id is not None:
+            predicates.append("requested_by = ?")
+            values.append(str(actor_id))
+        clause, params = self._where(*predicates)
+        states = dict(self.store._execute(
+            "SELECT state, COUNT(*) FROM telegram_jobs" + clause + " GROUP BY state",
+            tuple(params + values)).fetchall())
+        outcomes = dict(self.store._execute(
+            "SELECT outcome, COUNT(*) FROM telegram_jobs" + clause
+            + " AND outcome IS NOT NULL GROUP BY outcome",
+            tuple(params + values)).fetchall())
+        return {"state": states, "outcome": outcomes}
+
+    def stop_pending(self) -> list[dict[str, Any]]:
+        return self._rows(f"stop_requested = 1 AND state IN ({self._marks((WAITING, RUNNING))})",
+                          [WAITING, RUNNING], order="created_at, id")
+
+    def amend_pending(self) -> list[dict[str, Any]]:
+        """Running jobs whose next turn is already waiting for them.
+
+        The staged text is the request: something wrote an amendment, and until
+        the process is stopped and the row goes back to waiting, nothing has
+        acted on it. That makes a column for the intent unnecessary — the text
+        being there is the intent.
+        """
+        return [row for row in self._rows("state = ?", (RUNNING,),
+                                          order="started_at, id")
+                if self._amendment_rows(row["id"], ("pending",))]
+
+    def self_resuming(self) -> list[dict[str, Any]]:
+        """Stopped work the daemon continues on its own, without being asked."""
+        now = iso()
+        return self._rows(
+            f"state = ? AND outcome IN ({self._marks(SELF_RESUMING)}) "
+            "AND (outcome <> ? OR resume_at IS NULL OR resume_at <= ?)",
+            [STOPPED, *SELF_RESUMING, QUOTA, now], order="created_at, id")
+
+    def quota_until(self) -> str | None:
+        row = self.store._execute(
+            "SELECT MAX(resume_at) FROM telegram_jobs WHERE project_id = ? AND "
+            "environment = ? AND surface = ? AND state = ? AND outcome = ? "
+            "AND resume_at > ?",
+            (self.project_id, self.environment, self.surface, STOPPED, QUOTA, iso())).fetchone()
+        return row[0] if row else None
+
+    def pending_deliveries(self, limit: int = 50) -> list[dict[str, Any]]:
+        return self._rows("delivery_state = ?", ("pending",),
+                          order="execution_finished_at, id", limit=limit)
+
+    def claim_deliveries(self, owner_id: str, *, limit: int = 20,
+                         lease_seconds: float = 30) -> list[dict[str, Any]]:
+        """Lease results to one sender. Delivery is deliberately at-least-once."""
+        now = iso()
+        until = (datetime.now(timezone.utc)
+                 + timedelta(seconds=max(1.0, lease_seconds))).isoformat(
+                     timespec="microseconds")
+        claimed: list[str] = []
+        with self.store.transaction():
+            rows = self.store._execute(
+                "SELECT id FROM telegram_jobs WHERE project_id = ? AND environment = ? "
+                "AND surface = ? AND (delivery_state = ? OR (delivery_state = ? "
+                "AND delivery_lease_expires_at <= ?)) ORDER BY execution_finished_at, id LIMIT ?",
+                (self.project_id, self.environment, self.surface, "pending",
+                 "delivering", now, max(1, int(limit)))).fetchall()
+            for (job_id,) in rows:
+                token = str(uuid4())
+                clause, params = self._where(
+                    "id = ?", "(delivery_state = ? OR (delivery_state = ? "
+                    "AND delivery_lease_expires_at <= ?))")
+                cur = self.store._execute(
+                    "UPDATE telegram_jobs SET delivery_state = ?, delivery_owner = ?, "
+                    "delivery_token = ?, delivery_lease_expires_at = ?, "
+                    "delivery_attempts = delivery_attempts + 1, updated_at = ?" + clause,
+                    tuple(["delivering", owner_id, token, until, now] + params
+                          + [job_id, "pending", "delivering", now]))
+                if cur.rowcount == 1:
+                    claimed.append(job_id)
+        return [row for job_id in claimed if (row := self.get(job_id)) is not None]
+
+    # -- writes ---------------------------------------------------------------
+
+    def register(self, *, channel_key: str, requested_by: str, description: str,
+                 engine: str, origin_message_id: str | None = None,
+                 model: str | None = None, profile: str | None = None) -> dict[str, Any]:
+        """Enter one task into the queue. No duration is promised, because none
+        can be honoured."""
+        description = str(description or "").strip()
+        if not description:
+            raise JobError("no_description",
+                           "a job needs one line describing it in the operator's terms")
+        if engine not in ENGINES:
+            raise JobError("bad_engine",
+                           f"engine {engine!r} must be one of {', '.join(ENGINES)}")
+        if not str(channel_key or "").strip():
+            raise JobError("no_channel", "a job needs the channel it reports into")
+        if not str(requested_by or "").strip():
+            raise JobError("no_requester",
+                           "a job needs the operator whose authority it carries")
+        origin = None if origin_message_id is None else str(origin_message_id)
+        if origin is not None:
+            existing = self._rows(
+                "channel_key = ? AND origin_message_id = ?",
+                (str(channel_key), origin), limit=1)
+            if existing:
+                return existing[0]
+        job_id = str(uuid4())
+        now = iso()
+        try:
+            with self.store.transaction():
+                self.store._execute(
+                    "INSERT INTO telegram_jobs (id, project_id, environment, surface, "
+                    "channel_key, requested_by, origin_message_id, description, engine, "
+                    "model, profile, state, attempt, amendments, stop_requested, "
+                    "created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?)",
+                    (job_id, self.project_id, self.environment, self.surface,
+                     str(channel_key), str(requested_by), origin,
+                     description, engine, model, profile, DRAFT, now, now))
+        except Exception:
+            # The unique origin index is the concurrent-delivery fence. If the
+            # other registrar won, return that one durable identity; otherwise
+            # preserve the actual storage failure.
+            if origin is not None:
+                existing = self._rows(
+                    "channel_key = ? AND origin_message_id = ?",
+                    (str(channel_key), origin), limit=1)
+                if existing:
+                    return existing[0]
+            raise
+        return self.get(job_id)
+
+    def update(self, job_id: str, **columns: Any) -> dict[str, Any] | None:
+        """One scoped write. `updated_at` moves on every one of them, amendments
+        included, so the column means what it says."""
+        columns.setdefault("updated_at", iso())
+        assignments = ", ".join(f"{name} = ?" for name in columns)
+        clause, params = self._where("id = ?")
+        with self.store.transaction():
+            self.store._execute(f"UPDATE telegram_jobs SET {assignments}" + clause,
+                                tuple(list(columns.values()) + params + [job_id]))
+        return self.get(job_id)
+
+    def start(self, job_id: str, *, pid: int | None = None,
+              session_id: str | None = None, model: str | None = None,
+              log_path: str | None = None, owner_id: str | None = None,
+              owner_host: str | None = None, lease_seconds: float = 30) -> dict[str, Any] | None:
+        """Take a waiting job into `running`.
+
+        The claim is conditional on the row still waiting, so on a store two
+        runners share, whichever updates first owns the job and the other is
+        told by getting no row back. The outcome is cleared because it
+        described the stop this start has just ended.
+        """
+        now = iso()
+        token = str(uuid4())
+        lease_until = (datetime.now(timezone.utc)
+                       + timedelta(seconds=max(1.0, lease_seconds))).isoformat(
+                           timespec="microseconds")
+        clause, params = self._where("id = ?", "state = ?")
+        with self.store.transaction():
+            cur = self.store._execute(
+            "UPDATE telegram_jobs SET state = ?, outcome = NULL, "
+            "attempt = attempt + 1, attempt_token = ?, lease_owner = ?, "
+            "lease_expires_at = ?, owner_host = ?, pid = ?, pgid = ?, "
+            "started_at = COALESCE(started_at, ?), updated_at = ?" + clause,
+            tuple([RUNNING, token, owner_id, lease_until, owner_host, pid, pid,
+                   now, now] + params + [job_id, WAITING]))
+        if not cur.rowcount:
+            return None
+        columns: dict[str, Any] = {}
+        if session_id is not None:
+            columns["session_id"] = session_id
+        if model is not None:
+            columns["model"] = model
+        if log_path is not None:
+            columns["log_path"] = log_path
+        return self.update(job_id, **columns) if columns else self.get(job_id)
+
+    def begin_direct(self, job_id: str, *, owner_id: str, owner_host: str,
+                     lease_seconds: float = 30) -> dict[str, Any] | None:
+        """Take a draft straight into `running`, outside the runner's budget.
+
+        The row never passes through `waiting`, so no runner can claim it while
+        its owner is starting it. The attempt carries a lease and a slot row like
+        any other, which is what lets a later daemon of any version fence it if
+        this one dies; the slot is numbered below zero, and `claim_next` only
+        ever looks for a free one from zero up to `max_parallel`.
+        """
+        if holds_slot(owner_id):
+            raise JobError("not_a_direct_owner",
+                           f"owner {owner_id!r} is not spelled as a direct owner")
+        now = iso()
+        token = str(uuid4())
+        lease_until = (datetime.now(timezone.utc)
+                       + timedelta(seconds=max(1.0, lease_seconds))).isoformat(
+                           timespec="microseconds")
+        clause, params = self._where("id = ?", "state = ?")
+        for _ in range(5):
+            try:
+                with self.store.transaction():
+                    cur = self.store._execute(
+                        "UPDATE telegram_jobs SET state = ?, outcome = NULL, "
+                        "attempt = attempt + 1, attempt_token = ?, lease_owner = ?, "
+                        "lease_expires_at = ?, owner_host = ?, pid = NULL, pgid = NULL, "
+                        "started_at = COALESCE(started_at, ?), updated_at = ?" + clause,
+                        tuple([RUNNING, token, owner_id, lease_until, owner_host, now, now]
+                              + params + [job_id, DRAFT]))
+                    if not cur.rowcount:
+                        return None
+                    lowest = self.store._execute(
+                        "SELECT MIN(slot) FROM telegram_job_slots WHERE project_id = ? "
+                        "AND environment = ? AND surface = ?",
+                        (self.project_id, self.environment, self.surface)).fetchone()[0]
+                    slot = min(-1, int(lowest) - 1) if lowest is not None else -1
+                    self.store._execute(
+                        "INSERT INTO telegram_job_slots (project_id, environment, surface, "
+                        "slot, job_id, owner_id, attempt_token, lease_expires_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (self.project_id, self.environment, self.surface, slot, job_id,
+                         owner_id, token, lease_until))
+            except Exception as exc:
+                # Two direct attempts picking the same number at once is the
+                # ordinary race `claim_next` also meets; the next try picks again.
+                if ("integrity" in type(exc).__name__.lower()
+                        or getattr(exc, "sqlstate", None) == "23505"):
+                    continue
+                raise
+            return self.get(job_id)
+        return None
+
+    def claim_next(self, *, owner_id: str, owner_host: str,
+                   max_parallel: int, lease_seconds: float = 30) -> dict[str, Any] | None:
+        """Claim the oldest job and one shared slot.
+
+        Slot rows make the parallel budget a store invariant rather than one
+        daemon's in-memory count. Expired slot rows are recoverable leases; the
+        attempt token on the job fences any late completion from their owner.
+        """
+        max_parallel = max(1, int(max_parallel))
+        now = iso()
+        lease_until = (datetime.now(timezone.utc)
+                       + timedelta(seconds=max(1.0, lease_seconds))).isoformat(
+                           timespec="microseconds")
+        token = str(uuid4())
+        try:
+            with self.store.transaction():
+                used = {int(r[0]) for r in self.store._execute(
+                    "SELECT slot FROM telegram_job_slots WHERE project_id = ? AND "
+                    "environment = ? AND surface = ?",
+                    (self.project_id, self.environment, self.surface)).fetchall()}
+                slot = next((n for n in range(max_parallel) if n not in used), None)
+                if slot is None:
+                    return None
+                candidate = self.store._execute(
+                    "SELECT id FROM telegram_jobs WHERE project_id = ? AND surface = ? "
+                    "AND environment = ? AND state = ? ORDER BY created_at, id LIMIT ?",
+                    (self.project_id, self.surface, self.environment, WAITING, 1)).fetchone()
+                if not candidate:
+                    return None
+                job_id = candidate[0]
+                self.store._execute(
+                    "INSERT INTO telegram_job_slots (project_id, environment, surface, "
+                    "slot, job_id, owner_id, attempt_token, lease_expires_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (self.project_id, self.environment, self.surface, slot, job_id,
+                     owner_id, token, lease_until))
+                clause, params = self._where("id = ?", "state = ?")
+                cur = self.store._execute(
+                    "UPDATE telegram_jobs SET state = ?, outcome = NULL, "
+                    "attempt = attempt + 1, attempt_token = ?, lease_owner = ?, "
+                    "lease_expires_at = ?, owner_host = ?, pid = NULL, pgid = NULL, "
+                    "started_at = COALESCE(started_at, ?), updated_at = ?" + clause,
+                    tuple([RUNNING, token, owner_id, lease_until, owner_host, now, now]
+                          + params + [job_id, WAITING]))
+                if not cur.rowcount:
+                    raise JobError("claim_lost", f"job {job_id} was claimed concurrently")
+        except JobError:
+            return None
+        except Exception as exc:
+            # Uniqueness races for the same slot or candidate are ordinary:
+            # another daemon got there first. A subsequent tick will retry.
+            if ("integrity" in type(exc).__name__.lower()
+                    or getattr(exc, "sqlstate", None) == "23505"):
+                return None
+            raise
+        return self.get(job_id)
+
+    def attach_process(self, job_id: str, attempt_token: str, owner_id: str, *, pid: int,
+                       pgid: int | None = None) -> bool:
+        clause, params = self._where(
+            "id = ?", "state = ?", "attempt_token = ?", "lease_owner = ?")
+        with self.store.transaction():
+            cur = self.store._execute(
+                "UPDATE telegram_jobs SET pid = ?, pgid = ?, updated_at = ?" + clause,
+                tuple([int(pid), int(pgid or pid), iso()] + params
+                      + [job_id, RUNNING, attempt_token, owner_id]))
+        return bool(cur.rowcount)
+
+    def update_attempt(self, job_id: str, attempt_token: str, owner_id: str,
+                       **columns: Any) -> dict[str, Any] | None:
+        columns.setdefault("updated_at", iso())
+        clause, params = self._where(
+            "id = ?", "state = ?", "attempt_token = ?", "lease_owner = ?")
+        assignments = ", ".join(f"{name} = ?" for name in columns)
+        with self.store.transaction():
+            cur = self.store._execute(
+                f"UPDATE telegram_jobs SET {assignments}" + clause,
+                tuple(list(columns.values()) + params
+                      + [job_id, RUNNING, attempt_token, owner_id]))
+        return self.get(job_id) if cur.rowcount else None
+
+    def renew(self, job_id: str, attempt_token: str, owner_id: str,
+              lease_seconds: float = 30) -> bool:
+        until = (datetime.now(timezone.utc)
+                 + timedelta(seconds=max(1.0, lease_seconds))).isoformat(
+                     timespec="microseconds")
+        clause, params = self._where(
+            "id = ?", "state = ?", "attempt_token = ?", "lease_owner = ?")
+        try:
+            with self.store.transaction():
+                cur = self.store._execute(
+                    "UPDATE telegram_jobs SET lease_expires_at = ?, updated_at = ?" + clause,
+                    tuple([until, iso()] + params
+                          + [job_id, RUNNING, attempt_token, owner_id]))
+                if cur.rowcount != 1:
+                    raise JobError("lease_lost", f"job {job_id} no longer owns its attempt")
+                slot = self.store._execute(
+                    "UPDATE telegram_job_slots SET lease_expires_at = ? WHERE project_id = ? "
+                    "AND environment = ? AND surface = ? AND job_id = ? AND owner_id = ? "
+                    "AND attempt_token = ?",
+                    (until, self.project_id, self.environment, self.surface, job_id,
+                     owner_id, attempt_token))
+                if slot.rowcount != 1:
+                    raise JobError("lease_lost", f"job {job_id} no longer owns its slot")
+        except JobError:
+            return False
+        return True
+
+    def fence_expired_attempt(
+            self, row: dict[str, Any], reason: str,
+            before_release: Callable[[], None] | None = None,
+            result_text: str | None = None) -> dict[str, Any] | None:
+        """Stop exactly the expired attempt observed by a reconciler.
+
+        The row transition and slot release are one transaction. If its owner
+        renewed either record after the snapshot, no predicate matches and the
+        slot remains unavailable. `result_text`, when given, is queued for
+        delivery to the job's channel in the same transition.
+        """
+        job_id = row["id"]
+        token = row.get("attempt_token")
+        owner = row.get("lease_owner")
+        observed = row.get("lease_expires_at")
+        if not token or not owner or not observed:
+            return None
+        now = iso()
+        clause, params = self._where(
+            "id = ?", "state = ?", "attempt_token = ?", "lease_owner = ?",
+            "lease_expires_at = ?", "lease_expires_at <= ?")
+        delivery = ""
+        delivery_values: list[Any] = []
+        if result_text is not None:
+            delivery = (", result_text = ?, result_silent = 0, delivery_state = ?, "
+                        "delivered_at = NULL, delivery_owner = NULL, "
+                        "delivery_token = NULL, delivery_lease_expires_at = NULL")
+            delivery_values = [result_text, "pending"]
+        with self.store.transaction():
+            cur = self.store._execute(
+                "UPDATE telegram_jobs SET state = ?, outcome = ?, pid = NULL, pgid = NULL, "
+                "stop_requested = 0, finished_at = ?, execution_finished_at = ?, "
+                "error = ?, lease_expires_at = NULL, updated_at = ?" + delivery + clause,
+                tuple([STOPPED, INTERRUPTED, now, now, str(reason)[:500], now]
+                      + delivery_values
+                      + params + [job_id, RUNNING, token, owner, observed, now]))
+            if cur.rowcount != 1:
+                return None
+            # A local process group must be stopped while the exact attempt is
+            # fenced and its slot is still held. The row update's lock keeps
+            # renew/claim from crossing this
+            # callback; only after it returns may the slot become reusable.
+            if before_release is not None:
+                before_release()
+            slot = self.store._execute(
+                "DELETE FROM telegram_job_slots WHERE project_id = ? AND environment = ? "
+                "AND surface = ? AND job_id = ? AND owner_id = ? AND attempt_token = ? "
+                "AND lease_expires_at = ?",
+                (self.project_id, self.environment, self.surface, job_id,
+                 owner, token, observed))
+            if slot.rowcount != 1:
+                raise JobError("slot_mismatch", f"job {job_id} expired without its exact slot")
+            self.store._execute(
+                "UPDATE telegram_job_amendments SET state = ?, claim_token = NULL, "
+                "claimed_at = NULL WHERE project_id = ? AND environment = ? AND surface = ? "
+                "AND job_id = ? AND state = ? AND claim_token = ?",
+                ("pending", self.project_id, self.environment, self.surface,
+                 job_id, "claimed", token))
+        return self.get(job_id)
+
+    # -- the amendment hand-off -----------------------------------------------
+
+    def _amendment_rows(self, job_id: str, states: Sequence[str]) -> list[dict[str, Any]]:
+        marks = self._marks(states)
+        cur = self.store._execute(
+            "SELECT id, text, state, claim_token, created_at FROM "
+            "telegram_job_amendments WHERE project_id = ? AND environment = ? "
+            f"AND surface = ? AND job_id = ? AND state IN ({marks}) "
+            "ORDER BY created_at, id",
+            (self.project_id, self.environment, self.surface, job_id, *states))
+        return [{"id": r[0], "text": r[1], "state": r[2],
+                 "claim_token": r[3], "created_at": r[4]}
+                for r in cur.fetchall()]
+
+    def stage_amendment(self, job_id: str, text: str,
+                        *, actor_id: str | None = None) -> str | None:
+        """Append one user correction atomically and count exactly that row."""
+        text = str(text or "").strip()
+        current = self.get(job_id, actor_id=actor_id)
+        if not text or current is None:
+            return None
+        self._refuse_while_delivering(current, "amend")
+        amendment_id, now = str(uuid4()), iso()
+        predicates = ["id = ?"]
+        values: list[Any] = [job_id]
+        if actor_id is not None:
+            predicates.append("requested_by = ?")
+            values.append(str(actor_id))
+        clause, params = self._where(*predicates)
+        with self.store.transaction():
+            self.store._execute(
+                "INSERT INTO telegram_job_amendments (id, project_id, environment, "
+                "surface, job_id, text, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (amendment_id, self.project_id, self.environment, self.surface,
+                 job_id, text, "pending", now))
+            cur = self.store._execute(
+                "UPDATE telegram_jobs SET amendments = amendments + 1, updated_at = ?"
+                + clause, tuple([now] + params + values))
+            if not cur.rowcount:
+                raise JobError("job_not_found", f"no job {job_id} in this actor scope")
+        return amendment_id
+
+    def pending_amendment(self, job_id: str,
+                          *, actor_id: str | None = None) -> list[str]:
+        if self.get(job_id, actor_id=actor_id) is None:
+            return []
+        return [row["text"] for row in self._amendment_rows(
+            job_id, ("pending", "claimed"))]
+
+    def has_pending_amendment(self, job_id: str) -> bool:
+        return bool(self._amendment_rows(job_id, ("pending",)))
+
+    def _lock_attempt(self, job_id: str, attempt_token: str, owner_id: str) -> bool:
+        """Lock one exact attempt and its slot in the common row-then-slot order."""
+        job = self.store._execute(
+            "SELECT 1 FROM telegram_jobs WHERE project_id = ? AND environment = ? "
+            "AND surface = ? AND id = ? AND state = ? AND attempt_token = ? "
+            "AND lease_owner = ? FOR UPDATE",
+            (self.project_id, self.environment, self.surface, job_id, RUNNING,
+             attempt_token, owner_id)).fetchone()
+        if not job:
+            return False
+        slot = self.store._execute(
+            "SELECT 1 FROM telegram_job_slots WHERE project_id = ? AND environment = ? "
+            "AND surface = ? AND job_id = ? AND attempt_token = ? AND owner_id = ? FOR UPDATE",
+            (self.project_id, self.environment, self.surface, job_id,
+             attempt_token, owner_id)).fetchone()
+        return bool(slot)
+
+    def claim_amendments(self, job_id: str, attempt_token: str,
+                         owner_id: str) -> list[dict[str, Any]]:
+        """Claim pending additions without deleting them.
+
+        A crash leaves immutable rows behind. A later attempt may reclaim them;
+        only an explicit engine-acceptance acknowledgement removes them from
+        the pending view.
+        """
+        now = iso()
+        with self.store.transaction():
+            if not self._lock_attempt(job_id, attempt_token, owner_id):
+                return []
+            self.store._execute(
+                "UPDATE telegram_job_amendments SET state = ?, claim_token = ?, "
+                "claimed_at = ? WHERE project_id = ? AND environment = ? AND surface = ? "
+                "AND job_id = ? AND state = ?",
+                ("claimed", attempt_token, now, self.project_id, self.environment,
+                 self.surface, job_id, "pending"))
+        return [row for row in self._amendment_rows(job_id, ("claimed",))
+                if row["claim_token"] == attempt_token]
+
+    def ack_amendments(self, job_id: str, attempt_token: str,
+                       owner_id: str) -> int:
+        with self.store.transaction():
+            if not self._lock_attempt(job_id, attempt_token, owner_id):
+                return 0
+            cur = self.store._execute(
+                "UPDATE telegram_job_amendments SET state = ?, acked_at = ? WHERE "
+                "project_id = ? AND environment = ? AND surface = ? AND job_id = ? "
+                "AND state = ? AND claim_token = ?",
+                ("acked", iso(), self.project_id, self.environment, self.surface,
+                 job_id, "claimed", attempt_token))
+        return int(cur.rowcount or 0)
+
+    def take_amendment(self, job_id: str) -> list[str]:
+        """Operator compatibility for idle jobs only; runners use claim/ack."""
+        row = self.get(job_id)
+        if row is None or row["state"] == RUNNING:
+            return []
+        pending = self._amendment_rows(job_id, ("pending",))
+        if not pending:
+            return []
+        ids = [item["id"] for item in pending]
+        with self.store.transaction():
+            self.store._execute(
+                f"UPDATE telegram_job_amendments SET state = ?, acked_at = ? WHERE "
+                f"id IN ({self._marks(ids)}) AND state = ?",
+                ("acked", iso(), *ids, "pending"))
+        return [item["text"] for item in pending]
+
+    def amend(self, job_id: str, text: str | None = None,
+              *, actor_id: str | None = None) -> dict[str, Any] | None:
+        """Record that the job was stopped and continued with added context.
+
+        The row keeps its identity and its session; the added text goes to the
+        session by way of `stage_amendment`, and the count answers how many
+        user additions were made without confusing them with runner batches.
+        """
+        current = self.get(job_id, actor_id=actor_id)
+        if current is None:
+            return None
+        self._refuse_while_delivering(current, "amend")
+        if text:
+            self.stage_amendment(job_id, text, actor_id=actor_id)
+        if current["state"] == RUNNING:
+            # The amendment row is durable intent. Only the daemon that owns
+            # this exact attempt may stop its process and transition the job.
+            return self.get(job_id, actor_id=actor_id)
+        if current["state"] == DRAFT:
+            # Amending a draft is the draft being written. Continuing it is
+            # what `submit` is for, and doing it here would hand a job over
+            # at the very moment somebody said it was not right yet.
+            return self.get(job_id, actor_id=actor_id)
+        if (current["state"] == STOPPED and current.get("engine") != "stub"
+                and not current.get("session_id")):
+            # No checkpoint means continuing may repeat work already performed.
+            # Keep the addition pending until an explicit resume decision.
+            return self.get(job_id, actor_id=actor_id)
+        now = iso()
+        predicates = ["id = ?"]
+        values: list[Any] = [job_id]
+        if actor_id is not None:
+            predicates.append("requested_by = ?")
+            values.append(str(actor_id))
+        clause, params = self._where(*predicates)
+        with self.store.transaction():
+            self.store._execute(
+            "UPDATE telegram_jobs SET state = ?, "
+            "outcome = NULL, pid = NULL, pgid = NULL, stop_requested = 0, error = NULL, "
+            "lease_owner = NULL, lease_expires_at = NULL, "
+            "exit_code = NULL, finished_at = NULL, execution_finished_at = NULL, "
+            "resume_at = NULL, result_text = NULL, result_silent = 0, "
+            "delivery_state = NULL, delivery_attempts = 0, delivery_error = NULL, "
+            "delivered_at = NULL, delivery_owner = NULL, delivery_token = NULL, "
+            "delivery_lease_expires_at = NULL, updated_at = ?" + clause,
+            tuple([WAITING, now] + params + values))
+        return self.get(job_id)
+
+    def finish_amendment(self, job_id: str, attempt_token: str,
+                         owner_id: str) -> dict[str, Any] | None:
+        """Transition an amended attempt after its owner stopped the process."""
+        now = iso()
+        clause, params = self._where(
+            "id = ?", "state = ?", "attempt_token = ?", "lease_owner = ?")
+        with self.store.transaction():
+            current = self.store._execute(
+                "SELECT engine, session_id FROM telegram_jobs" + clause,
+                tuple(params + [job_id, RUNNING, attempt_token, owner_id])).fetchone()
+            if not current:
+                return None
+            safe = current[0] == "stub" or bool(current[1])
+            state, outcome = (WAITING, None) if safe else (STOPPED, INTERRUPTED)
+            error = None if safe else (
+                "amendment is pending but this attempt exposed no resumable checkpoint")
+            cur = self.store._execute(
+                "UPDATE telegram_jobs SET state = ?, outcome = ?, pid = NULL, pgid = NULL, "
+                "stop_requested = 0, error = ?, lease_expires_at = NULL, finished_at = ?, "
+                "updated_at = ?" + clause,
+                tuple([state, outcome, error, None if safe else now, now]
+                      + params + [job_id, RUNNING, attempt_token, owner_id]))
+            if cur.rowcount != 1:
+                return None
+            slot = self.store._execute(
+                "DELETE FROM telegram_job_slots WHERE project_id = ? AND environment = ? "
+                "AND surface = ? AND job_id = ? AND owner_id = ? AND attempt_token = ?",
+                (self.project_id, self.environment, self.surface, job_id,
+                 owner_id, attempt_token))
+            if slot.rowcount != 1:
+                raise JobError("slot_mismatch", f"job {job_id} lost its owned slot")
+            self.store._execute(
+                "UPDATE telegram_job_amendments SET state = ?, claim_token = NULL, "
+                "claimed_at = NULL WHERE project_id = ? AND environment = ? AND surface = ? "
+                "AND job_id = ? AND state = ? AND claim_token = ?",
+                ("pending", self.project_id, self.environment, self.surface,
+                 job_id, "claimed", attempt_token))
+        return self.get(job_id)
+
+    # -- stopping and continuing ----------------------------------------------
+    #
+    # One way to halt work and one way to continue it. There is no second pair
+    # for "stop for good", because the session is the checkpoint and every stop
+    # is therefore continuable: what a caller chooses is not whether the work
+    # can come back, only whether anybody asks it to.
+
+    def request_stop(self, job_id: str, *, actor_id: str | None = None) -> dict[str, Any] | None:
+        """Ask for the work to stop.
+
+        Asynchronous by nature: the runner holds the process group, so this
+        records the ask and the next tick acts on it. Without the flag there is
+        no state between "asked to stop" and "stopped".
+        """
+        row = self.get(job_id, actor_id=actor_id)
+        if row is None or row["state"] == STOPPED:
+            return None
+        predicates = ["id = ?"]
+        values: list[Any] = [job_id]
+        if actor_id is not None:
+            predicates.append("requested_by = ?")
+            values.append(str(actor_id))
+        clause, params = self._where(*predicates)
+        with self.store.transaction():
+            cur = self.store._execute(
+                "UPDATE telegram_jobs SET stop_requested = 1, updated_at = ?" + clause,
+                tuple([iso()] + params + values))
+        return self.get(job_id, actor_id=actor_id) if cur.rowcount else None
+
+    def discard(self, job_id: str, *, actor_id: str | None = None) -> dict[str, Any] | None:
+        """Drop a draft that is never going to be submitted.
+
+        This is not the second half of stopping. A draft holds no session and
+        no work: nothing has run, so there is no checkpoint to keep and nothing
+        to continue. What it holds is a line in the register that every turn is
+        told to read before submitting, so a draft somebody thought better of
+        is noise in exactly the surface a turn has to look at. Only a draft can
+        be discarded; work that has started stops and stays continuable.
+        """
+        row = self.get(job_id, actor_id=actor_id)
+        if row is None or row["state"] != DRAFT:
+            return None
+        predicates = ["id = ?", "state = ?"]
+        values: list[Any] = [job_id, DRAFT]
+        if actor_id is not None:
+            predicates.append("requested_by = ?")
+            values.append(str(actor_id))
+        clause, params = self._where(*predicates)
+        with self.store.transaction():
+            cur = self.store._execute(
+                "DELETE FROM telegram_jobs" + clause, tuple(params + values))
+        return row if cur.rowcount else None
+
+    def cancel_waiting(self, job_id: str, *, error: str,
+                       result_text: str | None = None) -> dict[str, Any] | None:
+        row = self.get(job_id)
+        if row is None or row["state"] != WAITING or not row["stop_requested"]:
+            return None
+        return self.stop(job_id, CANCELLED, error=error, result_text=result_text,
+                         expected_state=WAITING, require_stop_requested=True)
+
+    def stop(self, job_id: str, outcome: str, *, exit_code: int | None = None,
+             error: str | None = None, session_id: str | None = None,
+             model: str | None = None, attempt_token: str | None = None,
+             owner_id: str | None = None,
+             resume_at: str | None = None, result_text: str | None = None,
+             result_silent: bool = False, expected_state: str | None = None,
+             require_stop_requested: bool = False) -> dict[str, Any] | None:
+        """Land a stop, whatever caused it — the work finishing counts."""
+        if outcome not in OUTCOMES:
+            raise JobError("bad_outcome",
+                           f"outcome {outcome!r} must be one of {', '.join(OUTCOMES)}")
+        columns: dict[str, Any] = {
+            "state": STOPPED,
+            "outcome": outcome,
+            "pid": None,
+            "pgid": None,
+            "stop_requested": 0,
+            "finished_at": iso(),
+            "execution_finished_at": iso(),
+            "exit_code": exit_code,
+            "error": None if error is None else str(error)[:500],
+            "resume_at": resume_at,
+            "lease_expires_at": None,
+        }
+        if result_text is not None or result_silent:
+            columns["result_text"] = result_text
+            columns["result_silent"] = 1 if result_silent else 0
+            columns["delivery_state"] = "delivered" if result_silent else "pending"
+            columns["delivered_at"] = iso() if result_silent else None
+            columns["delivery_owner"] = None
+            columns["delivery_token"] = None
+            columns["delivery_lease_expires_at"] = None
+        if session_id is not None:
+            columns["session_id"] = session_id
+        if model is not None:
+            columns["model"] = model
+        columns["updated_at"] = iso()
+        if attempt_token is None and expected_state is None:
+            current = self.get(job_id)
+            if (current is not None and current["state"] == RUNNING
+                    and current.get("lease_owner")):
+                raise JobError(
+                    "attempt_fence_required",
+                    "a leased running attempt may only be completed by its exact owner")
+        predicates = ["id = ?"]
+        values: list[Any] = [job_id]
+        if attempt_token is not None:
+            if not owner_id:
+                raise JobError("no_attempt_owner",
+                               "a fenced attempt completion requires its lease owner")
+            predicates += ["state = ?", "attempt_token = ?", "lease_owner = ?"]
+            values += [RUNNING, attempt_token, owner_id]
+        elif expected_state is not None:
+            predicates.append("state = ?")
+            values.append(expected_state)
+        if require_stop_requested:
+            predicates.append("stop_requested = 1")
+        clause, params = self._where(*predicates)
+        assignments = ", ".join(f"{name} = ?" for name in columns)
+        with self.store.transaction():
+            cur = self.store._execute(
+                f"UPDATE telegram_jobs SET {assignments}" + clause,
+                tuple(list(columns.values()) + params + values))
+            if cur.rowcount:
+                slot_sql = (
+                    "DELETE FROM telegram_job_slots WHERE project_id = ? AND environment = ? "
+                    "AND surface = ? AND job_id = ?")
+                slot_params: list[Any] = [self.project_id, self.environment,
+                                          self.surface, job_id]
+                if attempt_token is not None:
+                    slot_sql += " AND attempt_token = ? AND owner_id = ?"
+                    slot_params += [attempt_token, owner_id]
+                slot = self.store._execute(slot_sql, slot_params)
+                if attempt_token is not None and slot.rowcount != 1:
+                    raise JobError("slot_mismatch", f"job {job_id} lost its owned slot")
+                if attempt_token is not None:
+                    self.store._execute(
+                        "UPDATE telegram_job_amendments SET state = ?, claim_token = NULL, "
+                        "claimed_at = NULL WHERE project_id = ? AND environment = ? "
+                        "AND surface = ? AND job_id = ? AND state = ? AND claim_token = ?",
+                        ("pending", self.project_id, self.environment, self.surface,
+                         job_id, "claimed", attempt_token))
+        return self.get(job_id) if cur.rowcount else None
+
+    def finish_delivery(self, job_id: str, delivery_token: str, owner_id: str,
+                        *, delivered: bool,
+                        error: str | None = None) -> dict[str, Any] | None:
+        now = iso()
+        clause, params = self._where(
+            "id = ?", "delivery_state = ?", "delivery_token = ?", "delivery_owner = ?")
+        with self.store.transaction():
+            cur = self.store._execute(
+                "UPDATE telegram_jobs SET delivery_state = ?, delivery_error = ?, "
+                "delivered_at = ?, delivery_owner = NULL, delivery_token = NULL, "
+                "delivery_lease_expires_at = NULL, updated_at = ?" + clause,
+                tuple(["delivered" if delivered else "pending",
+                       None if delivered else str(error or "delivery failed")[:500],
+                       now if delivered else None, now]
+                      + params + [job_id, "delivering", delivery_token, owner_id]))
+        return self.get(job_id) if cur.rowcount else None
+
+    def submit(self, job_id: str, *, actor_id: str | None = None) -> dict[str, Any] | None:
+        """Hand a draft over to the runner.
+
+        The one transition that ends authoring and begins work. It is
+        conditional on the row still being a draft, so a second submit of the
+        same job is refused rather than silently restarting work already in
+        flight, and a job that has moved on is left exactly where it is.
+        """
+        row = self.get(job_id, actor_id=actor_id)
+        if row is None:
+            return None
+        if row["state"] != DRAFT:
+            raise JobError("job_not_draft",
+                           f"job {job_id} is {row['state']}, not a draft",
+                           "only a draft is submitted; amend or resume the rest")
+        return self._actor_update(job_id, actor_id, state=WAITING)
+
+    def resume(self, job_id: str, *, actor_id: str | None = None) -> dict[str, Any] | None:
+        """Make sure this job is on its way, from wherever it is.
+
+        The exact counterpart of `request_stop`, and idempotent for the same
+        reason it is: both are asks about a direction, not about a transition.
+        Stopped work goes back to waiting on the session it already has — the
+        same job, same row, same rollout, and one that never started resumes by
+        starting. Work that is already moving simply loses a stop nobody wants
+        any more. There is no state this refuses, because there is no state a
+        job cannot continue from.
+        """
+        row = self.get(job_id, actor_id=actor_id)
+        if row is None:
+            return None
+        self._refuse_while_delivering(row, "resume")
+        if row["state"] != STOPPED:
+            if not row["stop_requested"]:
+                return row
+            return self._actor_update(job_id, actor_id, stop_requested=0)
+        return self._actor_update(
+            job_id, actor_id, state=WAITING, outcome=None, pid=None,
+            pgid=None, stop_requested=0, error=None, exit_code=None,
+            finished_at=None, execution_finished_at=None,
+            attempt_token=None, lease_owner=None, lease_expires_at=None,
+            resume_at=None, result_text=None, result_silent=0,
+            delivery_state=None, delivery_attempts=0, delivery_error=None,
+            delivered_at=None, delivery_owner=None, delivery_token=None,
+            delivery_lease_expires_at=None)
+
+    @staticmethod
+    def _refuse_while_delivering(row: dict[str, Any], action: str) -> None:
+        if row.get("delivery_state") not in ("pending", "delivering"):
+            return
+        raise JobError(
+            "result_delivery_pending",
+            f"cannot {action} job {row['id']} until its existing result is delivered",
+            "wait for result delivery, then try again")
+
+    def _actor_update(self, job_id: str, actor_id: str | None,
+                      **columns: Any) -> dict[str, Any] | None:
+        columns.setdefault("updated_at", iso())
+        predicates = ["id = ?"]
+        values: list[Any] = [job_id]
+        if actor_id is not None:
+            predicates.append("requested_by = ?")
+            values.append(str(actor_id))
+        clause, params = self._where(*predicates)
+        assignments = ", ".join(f"{name} = ?" for name in columns)
+        with self.store.transaction():
+            cur = self.store._execute(
+                f"UPDATE telegram_jobs SET {assignments}" + clause,
+                tuple(list(columns.values()) + params + values))
+        return self.get(job_id, actor_id=actor_id) if cur.rowcount else None
+
+    def interrupt_active(self, reason: str) -> list[dict[str, Any]]:
+        """Compatibility helper which fences only attempts already expired."""
+        rows = self.expired_active()
+        interrupted = []
+        for row in rows:
+            if self.fence_expired_attempt(row, reason) is not None:
+                interrupted.append(row)
+        return interrupted

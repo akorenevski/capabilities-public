@@ -4,6 +4,11 @@
       "path": "capabilities/my-notion",
       "payload_sha256": "ffec5c7e6d5419af5c5301687e09d73d061d4bec71975d7321e11d6ed583f325",
       "summary": "Notion CLI over the REST API — pages AND databases. Publish markdown, create/upsert pages; create databases, add/query/update rows (data-source model, 2026-03-11), and archive. Personal, multi-workspace."
+    },
+    "telegram-bot": {
+      "path": "capabilities/telegram-bot",
+      "payload_sha256": "b93debe69d1a2284bf85f859fb7912527c44e086632098c564c486a0d6ded7e2",
+      "summary": "One Telegram bot per project: the project's agent answers in allowed chats and forum topics when addressed (mention, reply, /command@bot), with a bot-to-bot loop guard. Bot API; derived from upstream telegram."
     }
   }
 }

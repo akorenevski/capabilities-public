@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""The `telegram-bot` a worker turn finds first on its PATH.
+
+Carried from upstream telegram `service/worker-bin/telegram` (auth_context,
+telegram_rule, rule_scope, flag_value, parse_command_and_chat,
+enforce_current_chat_scope, and the progress outbox), cut to this bot's verbs.
+The daemon puts this directory in front of PATH for every turn and hands the
+turn's authority in CAPABILITIES_AUTH_CONTEXT. When the sender's rule for
+`telegram-bot` carries `"scope": "current_chat"`, a send to any other chat or
+on another connection is refused with exit 4 (`chat_scope_denied`,
+`worker_scope_denied`) before the real CLI runs; the real CLI's own `send` and
+the contract gate check again behind it. The topic is the turn's, as upstream
+fixes it: `--topic` is refused inside a turn and the current topic is filled
+in, and `--reply-to` may name only the request the turn answers.
+
+`telegram-bot progress "<line>"` is the worker's progress verb: the line goes
+to the turn's outbox (TELEGRAM_PROGRESS_OUTBOX), and the daemon relays it into
+the chat, throttled. It exists only inside a turn the daemon started.
+"""
+import json
+import os
+import shutil
+import sys
+import time
+
+NAME = "telegram-bot"
+
+
+def fail(code, message, hint=None, exit_code=6):
+    error = {"code": code, "message": message}
+    if hint:
+        error["hint"] = hint
+    sys.stderr.write(json.dumps({"error": error}, ensure_ascii=False) + "\n")
+    raise SystemExit(exit_code)
+
+
+def auth_context():
+    raw = os.environ.get("CAPABILITIES_AUTH_CONTEXT")
+    if not raw:
+        return None
+    try:
+        if raw.lstrip().startswith("{"):
+            return json.loads(raw)
+        with open(raw, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError) as exc:
+        fail("worker_authority_invalid",
+             f"cannot read the daemon authority context: {exc}", exit_code=4)
+
+
+def telegram_rule(ctx):
+    caps = ctx.get("allowed_capabilities") or {}
+    if caps is True or caps == "*":
+        return True
+    if isinstance(caps, list):
+        return True if (NAME in caps or "*" in caps) else False
+    if not isinstance(caps, dict):
+        return None
+    return caps.get(NAME, caps.get("*"))
+
+
+def rule_scope(rule):
+    if rule is True or rule == "*":
+        return None
+    if isinstance(rule, dict):
+        return rule.get("scope")
+    return None
+
+
+def flag_value(argv, flag):
+    """(present, value) for `--flag V` and `--flag=V`."""
+    args = list(argv[1:])
+    for index, item in enumerate(args):
+        if item == flag:
+            return True, args[index + 1] if index + 1 < len(args) else None
+        if item.startswith(flag + "="):
+            return True, item.split("=", 1)[1]
+    return False, None
+
+
+def parse_command_and_chat(argv):
+    chat_commands = {"send"}
+    takes_value = {"--connection", "--topic", "--reply-to"}
+    args = list(argv[1:])
+    i = 0
+    while i < len(args):
+        item = args[i]
+        if item in takes_value:
+            i += 2
+            continue
+        if item.startswith("--"):
+            i += 1
+            continue
+        cmd = item
+        if cmd not in chat_commands:
+            return cmd, None
+        j = i + 1
+        while j < len(args) and args[j].startswith("--"):
+            j += 2 if args[j] in takes_value else 1
+        return cmd, args[j] if j < len(args) else None
+    return None, None
+
+
+def enforce_current_chat_scope(argv):
+    ctx = auth_context()
+    if ctx is None:
+        return
+    rule = telegram_rule(ctx)
+    if rule in (None, False):
+        return
+    if rule_scope(rule) != "current_chat":
+        return
+    cmd, chat = parse_command_and_chat(argv)
+    if cmd != "send":
+        return
+    current = str(ctx.get("chat_id") or "")
+    if str(chat) not in (current, "current", "$current"):
+        fail("chat_scope_denied", f"{NAME} is limited to the current chat for this request",
+             f"requested={chat}; current_chat_id={current}", exit_code=4)
+    present, topic = flag_value(argv, "--topic")
+    if present:
+        fail("worker_scope_denied", "--topic is not taken inside a bot turn: a send goes to "
+             "the current topic", f"requested={topic}; current_topic_id={ctx.get('topic_id')}",
+             exit_code=4)
+    present, reply_to = flag_value(argv, "--reply-to")
+    if present and str(reply_to) != str(ctx.get("message_id")):
+        fail("worker_scope_denied", "--reply-to can name only the request this turn answers",
+             f"requested={reply_to}; current_message_id={ctx.get('message_id')}", exit_code=4)
+    present, connection = flag_value(argv, "--connection")
+    authorized = str(ctx.get("connection") or "")
+    if present and authorized and connection != authorized:
+        fail("worker_scope_denied", "--connection cannot name another bot inside a bot turn",
+             f"requested={connection}; current_connection={authorized}", exit_code=4)
+
+
+def write_progress(argv):
+    """`progress <one text argument>` into the turn's outbox, for the daemon."""
+    if argv[1:2] != ["progress"]:
+        return False
+    outbox = os.environ.get("TELEGRAM_PROGRESS_OUTBOX")
+    if not outbox:
+        fail("worker_progress_unavailable",
+             f"{NAME} progress is a worker verb and this run has no progress channel",
+             "it exists only inside a turn the bot service started")
+    args = list(argv[1:])
+    if len(args) != 2 or args[1].startswith("--"):
+        fail("worker_progress_invalid",
+             f"worker progress syntax is: {NAME} progress <one text argument>",
+             "quote the complete line; progress takes no flags and no chat")
+    text = sys.stdin.read().strip() if args[1] == "-" else args[1].strip()
+    if not text or text in ("-", ".", "..."):
+        fail("worker_progress_invalid", "a progress line must say something useful")
+    os.makedirs(os.path.dirname(outbox), exist_ok=True)
+    with open(outbox, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"time": time.time(), "text": text}, ensure_ascii=False) + "\n")
+    print(json.dumps({"ok": True, "queued": "telegram-bot-progress"}))
+    return True
+
+
+def real_cli():
+    real = os.environ.get("TELEGRAM_BOT_REAL_CLI")
+    if real:
+        return real
+    here = os.path.dirname(os.path.abspath(__file__))
+    rest = os.pathsep.join(p for p in os.environ.get("PATH", "").split(os.pathsep)
+                           if os.path.abspath(p or ".") != here)
+    found = shutil.which(NAME, path=rest)
+    if not found:
+        fail("real_cli_missing", f"the real {NAME} is not on PATH", exit_code=3)
+    return found
+
+
+def with_current_chat(argv):
+    """`send current ...` names the turn's own chat, and a send inside a turn
+    goes to its topic (General takes none); the real CLI takes ids."""
+    ctx = auth_context() or {}
+    cmd, chat = parse_command_and_chat(argv)
+    args = list(argv[1:])
+    if cmd != "send" or not ctx.get("chat_id"):
+        return args
+    if chat in ("current", "$current"):
+        args[args.index(chat)] = chat = str(ctx["chat_id"])
+    topic = ctx.get("topic_id")
+    if str(chat) == str(ctx["chat_id"]) and topic not in (None, 1, "1") \
+            and not flag_value(argv, "--topic")[0]:
+        args += ["--topic", str(topic)]
+    return args
+
+
+def main():
+    if write_progress(sys.argv):
+        return 0
+    enforce_current_chat_scope(sys.argv)
+    real = real_cli()
+    os.execvp(real, [real] + with_current_chat(sys.argv))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

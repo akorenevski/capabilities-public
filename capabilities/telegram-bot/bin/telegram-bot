@@ -1,0 +1,1267 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "capabilities-contract>=0.18,<1",
+#     "httpx>=0.27",
+# ]
+# ///
+"""telegram-bot — one Telegram bot per project: the project's agent answering in the chats
+and forum topics it is allowed into, beside people, other bots and a personal account.
+
+Author: Alexander Korenevski. MIT licence. Derived from the upstream `telegram`
+capability by Cluster One (MIT; its notice is kept in LICENSE-UPSTREAM, and UPSTREAM.md
+names the commit and what was taken). Where upstream signs a person's account in over MTProto, this speaks the
+Bot API with a bot token, so it reads no history and lists no dialogs: what the bot knows
+of a chat is what Telegram delivered to it while it ran.
+
+Contract:
+  telegram-bot help | stub | manifest --json | connections | guide [topic]
+  telegram-bot ids list|get|set|rm | refs | inventory [--network]
+  telegram-bot connection add|remove <id> ...   (contract; the token only on stdin)
+  telegram-bot connection add <id> --remote --env secret_env=KEY --field ...
+      The contract's add for a token that lives on another node (a server's
+      environment): the env key is recorded without being found here.
+  telegram-bot settings [get|set|unset|put|export] ...   (contract; the service settings)
+
+Commands:
+  telegram-bot doctor [--connection ID]
+      Resolve the connection, then ask Telegram `getMe` and compare it with the
+      connection's username and expected_bot_id. Exit 2 when the token does not
+      resolve or is refused; 6 when it belongs to another bot.
+  telegram-bot send <chat_id> <text> [--topic N] [--reply-to MSG] [--connection ID]
+      Send one message as the bot (a write: the connection needs allow_write).
+      Inside a bot turn whose authority limits telegram-bot to the current chat,
+      any other chat, topic or connection is refused (exit 4), the turn's topic
+      is used where --topic is left out, and --reply-to may name only the
+      request the turn answers. A send that may or
+      may not have arrived (a read timeout, a 5xx) is not repeated: exit 5
+      `send_uncertain`, "not sure it arrived" - look in the chat before sending again.
+  telegram-bot token set <id>
+      Read a bot token on stdin and write it to the user's credentials.env (outside
+      every project) under TELEGRAM_BOT_<ID>_TOKEN; the token is never echoed.
+  telegram-bot service init [--connection ID] [--force]
+      Seed the service settings in this project's records and the context prompt
+      in the project's store (a context.md the project already keeps is what is
+      seeded, else the template).
+  telegram-bot prompts list | show <key> [--version ID] | versions <key>
+  telegram-bot prompts put <key> <file|-> [--base ID] [--note TEXT]
+  telegram-bot prompts import|export [--dir DIR] [--note TEXT]
+      The service's prompts (`context`, read for every turn) as versions in the
+      project's store, so every node reads the one the store master saved; the
+      files under capabilities/telegram-bot/service/ are an optional export,
+      read only while the store holds no version of a key.
+  telegram-bot service doctor [--connection ID]
+      Settings valid, connection resolves, getMe matches, profiles resolve, daemon state.
+  telegram-bot service run|start|stop [--force]|reload|status [--connection ID]
+  telegram-bot service logs [--tail N]
+
+Connections: one per bot, each `{username, expected_bot_id, secret_env}`. The token is
+never a flag or a record value: `secret_env` names the env key (default
+TELEGRAM_BOT_<ID>_TOKEN), and the token lives outside every project - in
+~/.config/telegram-bot/credentials.env (`token set`), or in the process environment on
+a server. A token found in the project's .env.local/.env is refused, since the
+project's agent can read it; so is a project `connection add --stdin`, which would
+write it there. Add the connection with `--env secret_env=TELEGRAM_BOT_<ID>_TOKEN`.
+
+Settings (records, as upstream keeps its service settings; an unknown key, an
+out-of-range number or a string where a boolean belongs is refused): connection,
+direct_messages {mode (allowed_users|anyone|off), default_role}, allowed_users
+{<user id>: {name, role, kind, may_address, profile, brief, worker_timeout,
+tail_size, control, authority}}, allowed_groups {<chat id>: {name, role,
+member_role, members {<id>: {name, role, kind, may_address, control, authority}},
+triggers [username, reply, command], topics {<topic id>: {name, profile, brief,
+...}}, profile, brief, agent_dialogue, rate_limit, control, authority}}, control
+{roles {<role>: {commands}}}, authority {default, roles {<role>:
+{allowed_capabilities}}}, defaults {profile, worker_timeout, tail_size,
+max_parallel, poll_timeout, progress_after, debounce, agent_dialogue {max_turns,
+reset_on_human_message}, rate_limit {replies_per_minute, replies_per_minute_total}}.
+A bot answers only when addressed - @username, a reply to it, /command@username - in
+an allowed place by an allowed sender; another bot's bare reply is context, not a
+turn; a message ending in a `#noreply` line is never a turn, and the answers to one
+ending in `#external` carry `#noreply`. An addressed /command (/status, /profiles,
+/stop [N], /reload, /set, /help) is answered by the daemon, gated by role, never by
+the agent. What a turn may use is the sender's `authority`: seeded, a supervisor has
+every capability, a direct_user none, a group_member `telegram-bot send` in the current
+chat and topic and routine's read-only verbs. Every turn but a supervisor's runs on a
+restricted claude profile (restricted_profile, else telegram-claude-restricted, whatever
+harness the profile in force uses), with every folder outside the project denied. An
+assistant on a personal account (not a bot) must be listed "kind": "agent". A turn waits
+the room's debounce after the last addressed message. TELEGRAM_BOT_SERVICE_PROFILE in the
+environment outranks defaults.profile, as TELEGRAM_SERVICE_PROFILE does upstream. The
+daemon's state lives under $XDG_STATE_HOME/telegram-bot/projects/, outside the project.
+
+Exit codes: 0 ok, 2 credentials/auth, 3 not found, 4 policy, 5 network/service, 6 input/config.
+"""
+
+import hashlib
+import json
+import os
+import secrets
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import NoReturn
+
+NAME = 'telegram-bot'
+SUMMARY = ("One Telegram bot per project: the project's agent answers in allowed chats and "
+           "forum topics when addressed (mention, reply, /command@bot), with a bot-to-bot "
+           "loop guard. Bot API; derived from upstream telegram.")
+SCOPE = "project"
+CRED_KEYS = []  # every secret is a connection's own, named by its secret_env
+WRITE_VERBS = {"send"}
+WRITE_DEFAULT = False    # a message leaves the system: a connection grants it
+# Guides ship in the bundle and are read from it, so they always match the
+# installed version.
+_HERE = Path(__file__).resolve()
+DOCS_BASE = ((_HERE.parent.parent if _HERE.parent.name == "bin" else _HERE.parent)
+             / "guides").as_uri() + "/"
+STATE = True
+INVENTORY = {"network": "none"}   # the daemon's state is its pid and health files here
+POST_INSTALL: list[dict] = []
+CONN_FIELDS: list[dict] = [
+    {"key": "username", "label": "Bot username",
+     "help": "The bot's @name without the @, as BotFather registered it.",
+     "type": "string", "required": True},
+    {"key": "expected_bot_id", "label": "Bot id",
+     "help": "The bot's numeric id: the part of its token before the colon.",
+     "type": "integer", "required": True, "minimum": 1, "identity": True},
+    {"key": "secret_env", "label": "Bot token",
+     "help": "The token BotFather gave the bot.",
+     "type": "string", "secret": True, "required": True,
+     "env": "TELEGRAM_BOT_{ID}_TOKEN"},
+]
+SETTINGS = {
+    "homes": [{"scope": "project", "path": "service/settings.json", "format": "json",
+               "inherits": "global"},
+              {"scope": "global", "path": "service/settings.json", "format": "json"}],
+    "keys": [
+        {"key": "connection", "label": "Connection",
+         "help": "The bot connection the service runs on.",
+         "type": "string", "required": False, "scope": "project", "apply": "restart"},
+        {"key": "direct_messages.mode", "label": "Direct messages",
+         "help": "Who may message the bot directly.", "type": "enum",
+         "choices": ["allowed_users", "anyone", "off"], "scope": "project",
+         "apply": "reload"},
+        {"key": "defaults.profile", "label": "Profile",
+         "help": "The harness profile a turn runs on.", "type": "string",
+         "default": "stub", "scope": "project", "apply": "reload"},
+        {"key": "defaults.worker_timeout", "label": "Worker timeout",
+         "help": "Seconds a worker turn may take.", "type": "integer", "default": 600,
+         "minimum": 1, "scope": "project", "apply": "reload"},
+        {"key": "defaults.max_parallel", "label": "Parallel turns",
+         "help": "Turns running at once across conversations.", "type": "integer",
+         "default": 1, "minimum": 1, "scope": "project", "apply": "restart"},
+    ],
+}
+SERVICE = {
+    # One bot token is one getUpdates consumer: one node polls it at a time.
+    "placement": "exclusive",
+    "name": "bot",
+    "summary": "Project-local Telegram bot daemon: answers addressed messages with the "
+               "project's agent.",
+    "verbs": ["init", "doctor", "run", "start", "reload", "stop", "status", "logs"],
+    "config": "capabilities/telegram-bot/service",
+    "state": "<state-dir>/<connection>/service",
+    "deploy": {
+        "schema": "capabilities.service.deploy.v1",
+        "default_policy": "auto",
+        "command": ["telegram-bot", "service", "run"],
+        "environment": {
+            "required": [],
+            "optional": [{"key": "TELEGRAM_BOT_SERVICE_PROFILE"}],
+        },
+        "mounts": [
+            # The journal, /set overrides, the bot's lock and the log: kept
+            # across a container's restart, as upstream keeps its state.
+            {"name": "telegram_bot_state", "kind": "state",
+             "target": "{agent_home}/.local/state/telegram-bot"},
+            {"name": "claude_state", "kind": "shared", "target": "{agent_home}/.claude"},
+            {"name": "codex_state", "kind": "shared", "target": "{agent_home}/.codex"},
+        ],
+        "restart": "unless-stopped",
+        "doctor": ["telegram-bot", "service", "doctor"],
+    },
+}
+
+_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+CREDENTIALS_ENV = _CONFIG_HOME / NAME / "credentials.env"
+_STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+
+# The shared capability code is the capabilities-contract library's, bound here
+# into this script's namespace (SHEBANG.md, "The contract verbs").
+from capabilities_contract.capability import bind as _contract_bind
+
+_contract_bind(globals(), "core")
+_contract_bind(globals(), "store")
+
+_contract_bind(globals(), "connections")
+
+
+def _state_dir() -> Path:
+    """This project's state: under the user's state home, never inside the
+    project, where a turn could read it (the journal holds every chat's
+    unanswered text). One folder per project, by its real path."""
+    home = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state")) / NAME
+    root = _project_root()
+    if root is None:
+        return home
+    real = Path(root).resolve()
+    return home / "projects" / f"{real.name}-{hashlib.sha256(str(real).encode()).hexdigest()[:12]}"
+
+
+# --- The bundle ----------------------------------------------------------------
+
+def _bundle_dir() -> Path:
+    here = Path(__file__).resolve()
+    return here.parent.parent if here.parent.name == "bin" else here.parent
+
+
+def _service_file(*parts: str) -> Path:
+    path = _bundle_dir().joinpath("service", *parts)
+    if not path.exists():
+        _die(3, "service_bundle_missing", f"bundled file not found: {path}",
+             f"reinstall {NAME} from its source")
+    return path
+
+
+def _service_module(name: str):
+    where = str(_service_file())
+    if where not in sys.path:
+        sys.path.insert(0, where)
+    import importlib
+    return importlib.import_module(name)
+
+
+# --- Connections ---------------------------------------------------------------
+
+def _connections_report() -> dict:
+    reg, _reg_file = _connections_registry()
+    out: dict = {"default": None, "connections": {}}
+    conns = reg["connections"]
+    out["default"] = reg.get("default") or (next(iter(conns)) if len(conns) == 1 else None)
+    conn_mod = _service_module("connection")
+    for cid, raw in conns.items():
+        entry = raw if isinstance(raw, dict) else {}
+        key = str(entry.get("secret_env") or "") or conn_mod.env_key(cid)
+        value, tier, source = _resolve_env_key(key)
+        rows = [
+            _key_report("username", False, True, entry.get("username") or None,
+                        "connection" if entry.get("username") else None, None),
+            _key_report("expected_bot_id", False, True,
+                        str(entry["expected_bot_id"]) if entry.get("expected_bot_id") else None,
+                        "connection" if entry.get("expected_bot_id") else None, None),
+            _key_report(key, True, True, value, tier, source),
+        ]
+        out["connections"][cid] = {
+            "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
+            "identity": _connection_identity(entry),
+            "keys": rows}
+    return out
+
+
+def _cmd_connections() -> None:
+    _emit(_connections_report())
+
+
+def _resolved_connection(wanted: str | None) -> dict:
+    reg, _ = _connections_registry()
+    cid, entry = _select_connection(reg, wanted)
+    conn_mod = _service_module("connection")
+    entry = dict(entry or {})
+    entry["allow_write"] = bool(entry.get("allow_write", WRITE_DEFAULT))
+    try:
+        return conn_mod.resolve(cid, entry, _resolve_env_key)
+    except conn_mod.ConnectionProblem as problem:
+        _die(problem.exit_code, problem.code, problem.message, problem.hint)
+
+
+def _api(resolved: dict):
+    return _service_module("botapi").BotApi(resolved["token"])
+
+
+def _get_me(resolved: dict, api=None) -> dict:
+    botapi = _service_module("botapi")
+    try:
+        return (api or _api(resolved)).get_me()
+    except botapi.BotApiError as exc:
+        if exc.kind == "auth":
+            _die(2, "token_refused", str(exc),
+                 "BotFather's /token or /revoke gives the current token; put it under "
+                 f"{resolved['secret_env']}")
+        _die(5, "network_error", str(exc), "retry; `doctor` makes one getMe call")
+
+
+def cmd_doctor(wanted: str | None) -> dict:
+    report = _connections_report()
+    _doctor_gate(report, wanted)
+    resolved = _resolved_connection(wanted)
+    api = _api(resolved)
+    me = _get_me(resolved, api)
+    conn_mod = _service_module("connection")
+    problems = conn_mod.check_me(resolved, me)
+    if problems:
+        _die(6, "bot_mismatch", "; ".join(problems),
+             "correct the connection's username/expected_bot_id or its token")
+    return {"ok": True, "connection": resolved["id"],
+            "bot": {"id": me.get("id"), "username": me.get("username"),
+                    "name": me.get("first_name")},
+            **conn_mod.capabilities_report(me),
+            "token": {"key": resolved["secret_env"], "tier": resolved["tier"],
+                      "source": resolved["source"]},
+            "allow_write": resolved["allow_write"],
+            **_clock_report(getattr(api, "clock_offset", None))}
+
+
+CLOCK_SKEW_WARN = 60
+
+
+def _clock_report(offset) -> dict:
+    """The machine clock against Telegram's, with a warning past CLOCK_SKEW_WARN."""
+    if not isinstance(offset, (int, float)):
+        return {"clock_offset_seconds": None, "warnings": []}
+    warn = []
+    if abs(offset) > CLOCK_SKEW_WARN:
+        warn.append(f"this machine's clock is {abs(offset):.0f}s "
+                    f"{'ahead of' if offset > 0 else 'behind'} Telegram's; the daemon judges "
+                    "message age by Telegram's clock, but set the machine's right")
+    return {"clock_offset_seconds": round(offset, 1), "warnings": warn}
+
+
+def _current_chat_scope(chat: str, topic: int | None, wanted: str | None,
+                        reply_to: int | None = None) -> int | None:
+    """Inside a bot turn whose authority keeps telegram-bot to the current
+    chat, a send anywhere else is refused - behind the worker shim, for a
+    worker that calls this file by its full path. Answers the topic the send
+    goes to: the turn's own, also where none was given (None for General)."""
+    raw = os.environ.get("CAPABILITIES_AUTH_CONTEXT")
+    if not raw:
+        return topic
+    try:
+        ctx = json.loads(raw) if raw.lstrip().startswith("{") else json.loads(Path(raw).read_text())
+    except (OSError, ValueError):
+        _die(4, "auth_context_unreadable", "runtime authority context could not be read")
+    caps = ctx.get("allowed_capabilities") if isinstance(ctx, dict) else None
+    rule = caps.get(NAME, caps.get("*")) if isinstance(caps, dict) else None
+    if not isinstance(rule, dict) or rule.get("scope") != "current_chat":
+        return topic
+    current = str(ctx.get("chat_id") or "")
+    if str(chat) != current:
+        _die(4, "chat_scope_denied", f"{NAME} is limited to the current chat for this request",
+             f"requested={chat}; current_chat_id={current}")
+    allowed = ctx.get("topic_id")
+    if topic is not None and str(topic) != str(allowed):
+        _die(4, "worker_scope_denied", "--topic cannot name another topic inside a bot turn",
+             f"requested={topic}; current_topic_id={allowed}")
+    if reply_to is not None and str(reply_to) != str(ctx.get("message_id")):
+        _die(4, "worker_scope_denied", "--reply-to can name only the request this turn answers",
+             f"requested={reply_to}; current_message_id={ctx.get('message_id')}")
+    if wanted and ctx.get("connection") and wanted != ctx.get("connection"):
+        _die(4, "worker_scope_denied", "--connection cannot name another bot inside a bot turn")
+    return None if allowed in (None, 1, "1") else int(allowed)
+
+
+def cmd_send(wanted: str | None, chat: str, text: str, topic: int | None,
+             reply_to: int | None) -> dict:
+    topic = _current_chat_scope(chat, topic, wanted, reply_to)
+    resolved = _resolved_connection(wanted)
+    _write_gate(resolved["id"], resolved["allow_write"], "send")
+    botapi = _service_module("botapi")
+    try:
+        sent = _api(resolved).send_message(
+            chat, text, message_thread_id=topic,
+            reply_parameters=({"message_id": reply_to, "allow_sending_without_reply": True}
+                              if reply_to else None))
+    except botapi.BotApiError as exc:
+        if exc.kind == "uncertain":
+            _die(5, "send_uncertain", f"not sure it arrived: {exc}",
+                 "look in the chat before sending again: a second send may post it twice")
+        _die(2 if exc.kind == "auth" else 5, f"send_{exc.kind}", str(exc))
+    return {"sent": True, "chat_id": (sent.get("chat") or {}).get("id"),
+            "message_id": sent.get("message_id"), "topic": topic}
+
+
+def cmd_token_set(cid: str, given: str) -> dict:
+    """Write one bot token to the user's credentials.env, outside every project."""
+    conn_mod = _service_module("connection")
+    token = str(given or "").strip()
+    if not conn_mod.TOKEN_SHAPE.match(token):
+        _die(6, "token_malformed", "stdin does not hold a bot token",
+             "a bot token is `<bot id>:<secret>` as BotFather gives it; pipe it in, "
+             "never as an argument")
+    key = conn_mod.env_key(cid)
+    _env_file_write(CREDENTIALS_ENV, {key: token})
+    return {"written": key, "file": str(CREDENTIALS_ENV), "bot_id": int(token.split(":", 1)[0]),
+            "next": f"`{NAME} connection add {cid} --project --default --field username=<bot> "
+                    f"--field expected_bot_id={token.split(':', 1)[0]} "
+                    f"--env secret_env={key}`"}
+
+
+def _refuse_project_secret(argv: list) -> None:
+    """A project `connection add` with the token on stdin would write it to the
+    project's .env.local, which the project's agent can read."""
+    if argv[:2] == ["connection", "add"] and "--stdin" in argv \
+            and not {"--global", "--machine"} & set(argv):
+        _die(6, "token_outside_project",
+             "a bot token is not written into the project: its agent could read it",
+             f"`{NAME} token set <id>` with the token on stdin, then `connection add <id> "
+             "--project --env secret_env=TELEGRAM_BOT_<ID>_TOKEN --field ...`")
+
+
+# --- Service settings and context ----------------------------------------------
+
+def _service_settings() -> dict:
+    try:
+        return {key: row["value"] for key, row in _records().resolve(NAME, "setting").items()
+                if key != "connection.default"}
+    except StoreError as exc:
+        _die(6, exc.slug, exc.message, exc.hint)
+
+
+def _settings_check(scope: str, document: dict) -> list:
+    """What the service would refuse in `document` once written at `scope`."""
+    if scope not in ("project", "global") or _project_root() is None:
+        return []
+    other = "global" if scope == "project" else "project"
+    try:
+        held = {key: row["value"] for key, row in
+                _records().resolve_scope(NAME, "setting", other).items()
+                if key != "connection.default"}
+    except StoreError as exc:
+        return [exc.message]
+    merged = {**held, **document} if scope == "project" else {**document, **held}
+    return _service_module("settings_check").problems(merged)
+
+
+def _valid_settings() -> dict:
+    settings = _service_settings()
+    if not settings:
+        _die(6, "service_settings_missing", f"no {NAME} service settings in this project",
+             f"run `{NAME} service init`")
+    problems = _service_module("settings_check").problems(settings)
+    if problems:
+        _die(6, "service_settings_invalid", "; ".join(problems),
+             f"fix them with `{NAME} settings set|put`")
+    return settings
+
+
+def _prompts():
+    return _service_module("prompts")
+
+
+def _open_prompts(write: bool = False):
+    """The store connection and the project id the prompts are kept under; the
+    caller closes the connection."""
+    module = _prompts()
+    project_id = _project_id(write=write)
+    if not project_id:
+        _die(6, "no_project_identity", "this project declares no id (CAPABILITIES_PROJECT_ID)",
+             "run `capabilities init` in the project")
+    try:
+        conn = module.open_store(_project_root())
+    except module.PromptError as exc:
+        _die(5 if exc.slug in STORE_ENVIRONMENT_SLUGS else 6, exc.slug, exc.message, exc.hint)
+    return conn, str(project_id)
+
+
+def _context_file_body():
+    """The context document a project keeps as a file (`service/context.md`),
+    which the service reads only while the store holds no version of it."""
+    try:
+        found = _records().document_read(NAME, "context")
+    except StoreError as exc:
+        _die(6, exc.slug, exc.message, exc.hint)
+    return str(found["body"]) if found and found.get("body") is not None else None
+
+
+# Where the project keeps no store at all, the file is the context's only home.
+NO_STORE_SLUGS = ("store_not_configured", "no_project_identity")
+
+
+def _store_context() -> str:
+    """The context prompt the daemon reads for every turn: its active version
+    in the store, which every node reads alike; the project's file only while
+    the store holds none, or where the project has no store. A store that is
+    configured and does not answer raises its PromptError, never answers the
+    file: an old export would replace the saved prompt without a word."""
+    module = _prompts()
+    project_id = _project_id()
+    try:
+        if not project_id:
+            raise module.PromptError("no_project_identity",
+                                     "this project declares no id (CAPABILITIES_PROJECT_ID)",
+                                     "run `capabilities init` in the project")
+        conn = module.open_store(_project_root())
+        try:
+            row = module.active(conn, str(project_id), "context")
+        finally:
+            conn.close()
+    except module.PromptError as exc:
+        body = _context_file_body() if exc.slug in NO_STORE_SLUGS else None
+        if body is None:
+            raise
+        return body
+    if row is not None:
+        return str(row["body"])
+    return _context_file_body() or ""
+
+
+def _context_body() -> str:
+    """`_store_context`, or the store's refusal as the CLI reports it."""
+    module = _prompts()
+    try:
+        return _store_context()
+    except module.PromptError as exc:
+        _die(5 if exc.slug in STORE_ENVIRONMENT_SLUGS else 6, exc.slug, exc.message, exc.hint)
+
+
+def _context_or_own_copy(own) -> str:
+    """The context for a daemon about to start or reload: `_store_context`,
+    or, where the store does not answer and the daemon keeps its copy from its
+    last start or reload (`own`, a path or what answers one), that copy, and
+    stderr says so; with no copy, the store's refusal."""
+    module = _prompts()
+    try:
+        return _store_context()
+    except module.PromptError as exc:
+        path = own() if callable(own) else own
+        if not path.exists():
+            _die(5 if exc.slug in STORE_ENVIRONMENT_SLUGS else 6, exc.slug, exc.message,
+                 exc.hint)
+        sys.stderr.write(f"{NAME}: the context prompt could not be read ({exc.slug}: "
+                         f"{exc.message}); the daemon keeps its copy from its last start "
+                         f"or reload ({path})\n")
+        return path.read_text()
+
+
+def _saver() -> str:
+    return f"{_user_name()}@{node_name()}"
+
+
+def cmd_service_init(wanted: str | None, force: bool) -> dict:
+    root = _project_root()
+    if root is None:
+        _die(6, "project_required", "service init runs inside a project")
+    seed = json.loads(json.dumps(_service_module("settings_check").SEED))
+    if wanted:
+        seed["connection"] = wanted
+    adapter = _records()
+    written, skipped = [], []
+    existing = _service_settings()
+    if force or not existing:
+        for key in set(existing) - set(seed):
+            adapter.delete(NAME, "setting", key)
+        for key, value in seed.items():
+            adapter.set(NAME, "setting", key, value, actor=f"{NAME} service init")
+        written.append(f"{adapter.source}:{NAME}/settings")
+    else:
+        skipped.append(f"{adapter.source}:{NAME}/settings")
+    module = _prompts()
+    conn, project_id = _open_prompts(write=True)
+    try:
+        held = module.active(conn, project_id, "context")
+        if force or held is None:
+            # A context.md the project kept before is what it had; --force
+            # seeds the template again.
+            body = None if force else _context_file_body()
+            if body is None:
+                body = _service_file("templates", "context.md").read_text()
+            row, _saved = module.save(conn, project_id, "context", body,
+                                      f"{NAME} service init", note="seeded")
+            written.append(f"store:{module.TABLE}/context@{row['id']}")
+        else:
+            skipped.append(f"store:{module.TABLE}/context@{held['id']}")
+    except module.PromptError as exc:
+        _die(6, exc.slug, exc.message, exc.hint)
+    finally:
+        conn.close()
+    return {"initialized": NAME, "project": str(root), "written": written, "skipped": skipped,
+            "next": [f"`{NAME} settings set allowed_groups '<json>'` (and allowed_users)",
+                     f"grant the connection: capabilities set {NAME} grant <id> "
+                     "'{\"enabled\": true, \"allow_write\": true}'",
+                     f"`{NAME} service doctor`, then `{NAME} service start`"]}
+
+
+# --- Service state -------------------------------------------------------------
+
+def _service_paths(cid: str) -> dict:
+    base = _state_dir() / cid / "service"
+    return {"dir": base, "pid": base / "daemon.pid", "health": base / "health.json",
+            "log": base / "service.log", "context": base / "context.md"}
+
+
+def _read_json(path: Path):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def _pid_alive(pid) -> bool:
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _running_connections() -> list:
+    """Every connection whose daemon runs in this project now, by its pid file."""
+    found = []
+    base = _state_dir()
+    for pid_file in sorted(base.glob("*/service/daemon.pid")) if base.exists() else []:
+        try:
+            pid = int(pid_file.read_text().strip())
+        except (OSError, ValueError):
+            continue
+        if _pid_alive(pid):
+            found.append(pid_file.parent.parent.name)
+    return found
+
+
+def _wanted_connection(flag: str | None) -> str | None:
+    """The flag; else the connection a daemon runs on here now, so a changed
+    `connection` setting never loses sight of the daemon still running on the
+    old one; else the setting."""
+    if flag:
+        return flag
+    running = _running_connections()
+    if len(running) == 1:
+        return running[0]
+    value = _service_settings().get("connection")
+    return str(value) if value else None
+
+
+def _health_verdict(health, running: bool):
+    """Upstream's staleness verdict: a running daemon whose health says
+    `healthy` but has not polled within `stale_after_seconds` is `stale`."""
+    if not isinstance(health, dict):
+        return health
+    health = dict(health)
+    # Before its first poll answers, a daemon is as fresh as its last word.
+    stamp = health.get("last_poll_at") or health.get("updated_at")
+    age = None
+    if stamp:
+        try:
+            from datetime import datetime, timezone
+            age = max(0.0, (datetime.now(timezone.utc) - datetime.fromisoformat(
+                str(stamp).replace("Z", "+00:00"))).total_seconds())
+        except (TypeError, ValueError):
+            pass
+    try:
+        stale_after = float(health.get("stale_after_seconds") or 80)
+    except (TypeError, ValueError):
+        stale_after = 80.0
+    health["age_seconds"] = round(age, 1) if age is not None else None
+    health["healthy"] = bool(running and health.get("state") == "healthy"
+                             and age is not None and age <= stale_after)
+    if running and health.get("state") == "healthy" and not health["healthy"]:
+        health["state"] = "stale"
+    return health
+
+
+def cmd_service_status(flag: str | None) -> dict:
+    reg, _ = _connections_registry()
+    cid, _entry = _select_connection(reg, _wanted_connection(flag))
+    paths = _service_paths(cid)
+    health = _read_json(paths["health"])
+    try:
+        pid = int(paths["pid"].read_text().strip())
+    except (OSError, ValueError):
+        pid = health.get("pid") if isinstance(health, dict) else None
+    running = _pid_alive(pid)
+    return {"connection": cid, "running": running, "pid": pid if running else None,
+            "health": _health_verdict(health, running), "state_dir": str(paths["dir"]),
+            "log_file": str(paths["log"])}
+
+
+def _profile_problems(settings: dict) -> list:
+    """Every profile name the settings reach that upstream's profiles module
+    refuses, and every restricted profile that does not resolve or does not fit
+    (the daemon's own check), each asked under its file's header (both pin the
+    harness runner)."""
+    check = _service_module("settings_check")
+    names = {row["profile"] for row in check.profile_names(settings)}
+    env_profile = os.environ.get("TELEGRAM_BOT_SERVICE_PROFILE")
+    if env_profile:
+        names.add(env_profile)
+    if names <= {"stub"} and not check.restricted_profile_names(settings):
+        return []
+    uv = shutil.which("uv")
+    if uv is None:
+        return [{"code": "harness_runner_unavailable", "message": "uv is not on PATH"}]
+    root = _project_root()
+    ident = _project_id(refuse=False)
+    where = ["--project-root", str(root)] + (["--project-id", str(ident)] if ident else [])
+    asks = [([str(_service_file("profiles.py")), "check"],
+             {"settings": settings,
+              "environ": {"TELEGRAM_SERVICE_PROFILE": env_profile} if env_profile else {}}),
+            ([str(_service_file("daemon.py")), "check-restricted"], settings)]
+    problems = []
+    for script, given in asks:
+        done = None
+        try:
+            done = subprocess.run([uv, "run", "--quiet", "--script", *script, *where],
+                                  input=json.dumps(given), capture_output=True, text=True,
+                                  timeout=600)
+            answer = json.loads(done.stdout)
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            return [{"code": "harness_runner_unavailable",
+                     "message": (done.stderr if done is not None else "")[-400:]}]
+        problems += [one if isinstance(one, dict) else {"message": str(one)}
+                     for one in answer.get("problems") or []]
+    return problems
+
+
+def _problem_lines(problems: list) -> str:
+    return "; ".join(" ".join(str(part) for part in (p.get("position"), p.get("profile"))
+                              if part) + (": " if p.get("position") or p.get("profile") else "")
+                     + str(p.get("message")) for p in problems)
+
+
+def cmd_service_doctor(flag: str | None) -> dict:
+    settings = _valid_settings()
+    bot = cmd_doctor(_wanted_connection(flag))
+    if not bot["allow_write"]:
+        _die(4, "read_only", f"connection {bot['connection']!r} does not allow writes, and "
+             "the bot answers by sending", "Do not lift the gate yourself — ask the user")
+    problems = _profile_problems(settings)
+    if problems:
+        _die(6, "profile_refused", _problem_lines(problems))
+    status = cmd_service_status(bot["connection"])
+    health = status.get("health") or {}
+    if status["running"] and health.get("state") not in ("healthy", "starting"):
+        _die(5, "service_unhealthy", f"daemon state is {health.get('state')}"
+             + (f": {health['problem']}" if health.get("problem") else ""),
+             f"`{NAME} service logs`")
+    warnings = list(bot.get("warnings") or []) + \
+        _service_module("settings_check").warnings(settings)
+    previous = health.get("previous_exit") if status["running"] else None
+    if isinstance(previous, dict) and previous.get("unclean"):
+        warnings.append(f"the process before this one (pid {previous.get('pid')}) was killed, "
+                        f"not stopped: its health was left at {previous.get('state')!r}")
+    if health.get("uncertain_sends"):
+        warnings.append(f"{health['uncertain_sends']} answer piece(s) may not have arrived "
+                        "(a send timed out after leaving); none was sent twice")
+    return {"ok": True, "bot": bot, "running": status["running"], "warnings": warnings,
+            "daemon_state": health.get("state") if status["running"] else None,
+            "groups": sorted((settings.get("allowed_groups") or {}).keys()),
+            "profile": (os.environ.get("TELEGRAM_BOT_SERVICE_PROFILE")
+                        or (settings.get("defaults") or {}).get("profile") or "stub")}
+
+
+def _write_private(path: Path, text: str) -> None:
+    """`text` into `path`, owner-only like everything in the state folder."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(text)
+
+
+def _clear_old_state(root) -> None:
+    """The state folder 0.3.0 kept inside the project (journal, log,
+    overrides), removed at the next start or run: a turn could read it there.
+    Left while a daemon whose pid file is in it still runs."""
+    old = _project_capabilities_dir(root) / NAME / "state"
+    if not old.is_dir():
+        return
+    for pid_file in old.glob("*/service/daemon.pid"):
+        try:
+            if _pid_alive(int(pid_file.read_text().strip())):
+                sys.stderr.write(f"{NAME}: {old} is still in use by a running 0.3.0 daemon; "
+                                 "stop it, then start again to remove it\n")
+                return
+        except (OSError, ValueError):
+            continue
+    shutil.rmtree(old, ignore_errors=True)
+    sys.stderr.write(f"{NAME}: removed the 0.3.0 state folder inside the project ({old})\n")
+
+
+def _launch(flag: str | None) -> tuple[list, dict, dict, dict]:
+    """What a daemon is started with: argv, environment, paths, resolved connection."""
+    _valid_settings()
+    body = _context_or_own_copy(
+        lambda: _service_paths(_resolved_connection(_wanted_connection(flag))["id"])["context"])
+    if not body.strip():
+        # Upstream refuses to start without its prompt documents: the context
+        # document is where the bot's posture lives.
+        _die(6, "context_missing", f"no {NAME} context prompt in this project's store",
+             f"`{NAME} service init` seeds it; `{NAME} prompts put context <file>` saves one")
+    resolved = _resolved_connection(_wanted_connection(flag))
+    _write_gate(resolved["id"], resolved["allow_write"], "send")
+    root = _project_root()
+    paths = _service_paths(resolved["id"])
+    paths["dir"].mkdir(parents=True, exist_ok=True)
+    _clear_old_state(root)
+    _write_private(paths["context"], body)
+    _project_id(write=True)
+    # The token reaches the daemon under one key only: the connection's own key
+    # (from the process tier on a server) is left out, as is a stale service
+    # key; the daemon keeps every TELEGRAM_BOT_* key from its workers.
+    env = {k: v for k, v in os.environ.items()
+           if k not in (resolved["secret_env"], "TELEGRAM_BOT_SERVICE_TOKEN")}
+    env.update({
+        "TELEGRAM_BOT_SERVICE_TOKEN": resolved["token"],
+        "TELEGRAM_BOT_PROJECT_ROOT": str(root),
+        "TELEGRAM_BOT_PROJECT_ID": str(_project_id(refuse=False) or ""),
+        "TELEGRAM_BOT_STATE_DIR": str(paths["dir"]),
+        "TELEGRAM_BOT_CLI": str(Path(__file__).resolve()),
+        "TELEGRAM_BOT_EXPECTED_ID": str(resolved["expected_bot_id"]),
+        "TELEGRAM_BOT_CONNECTION": resolved["id"],
+        "TELEGRAM_BOT_SECRET_ENV": resolved["secret_env"],
+        "TELEGRAM_BOT_CONTEXT": str(paths["context"]),
+        "TELEGRAM_BOT_LOG_FILE": str(paths["log"]),
+        "TELEGRAM_BOT_LAUNCH_NONCE": secrets.token_hex(24),
+        "CAPABILITIES_PROJECT_ENVELOPE": str(_project_capabilities_dir(root).resolve()),
+    })
+    return [str(_service_file("daemon.py"))], env, paths, resolved
+
+
+RUN_RETRY_SECONDS = 60
+
+
+def _waiting_health(flag: str | None) -> Path:
+    """Where `service run` says it is waiting: the health file of the
+    connection it would run, else one beside the connections."""
+    import contextlib
+    import io
+    cid = None
+    with contextlib.redirect_stderr(io.StringIO()), contextlib.suppress(SystemExit):
+        reg, _ = _connections_registry()
+        cid, _entry = _select_connection(reg, _wanted_connection(flag))
+    return _service_paths(cid)["health"] if cid else _state_dir() / "waiting-health.json"
+
+
+def cmd_service_run(flag: str | None, sleep=time.sleep) -> NoReturn:
+    """Under a supervisor: exec the daemon. With nothing to run on yet - no
+    credentials, settings that do not pass, no context, the store down - wait
+    and try again every RUN_RETRY_SECONDS instead of
+    exiting, so the supervisor does not restart it in a loop; its health
+    record says `waiting` and why."""
+    import contextlib
+    import io
+    while True:
+        caught = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(caught):
+                argv, env, _paths, _resolved = _launch(flag)
+            break
+        except SystemExit as stopped:
+            said = caught.getvalue().strip()
+            sys.stderr.write(said + "\n")
+            try:
+                problem = json.loads(said.splitlines()[-1])["error"]["message"]
+            except (ValueError, KeyError, IndexError, TypeError):
+                problem = said or f"exit {stopped.code}"
+            health = _waiting_health(flag)
+            health.parent.mkdir(parents=True, exist_ok=True)
+            health.write_text(json.dumps({
+                "state": "waiting", "pid": os.getpid(), "problem": problem,
+                "exit_code": stopped.code, "retry_seconds": RUN_RETRY_SECONDS,
+                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}) + "\n")
+            sys.stderr.write(f"{NAME} service run: waiting {RUN_RETRY_SECONDS}s before trying "
+                             f"again ({problem})\n")
+            sys.stderr.flush()
+            sleep(RUN_RETRY_SECONDS)
+    env.pop("TELEGRAM_BOT_LOG_FILE", None)   # under a supervisor the log is stdout
+    os.chdir(env["TELEGRAM_BOT_PROJECT_ROOT"])
+    os.execve(argv[0], argv, env)
+
+
+def _refuse_profiles(settings: dict) -> None:
+    problems = _profile_problems(settings)
+    if problems:
+        _die(6, "profile_refused", _problem_lines(problems),
+             "fix the settings' profile names, or the profiles, before starting or reloading")
+
+
+def cmd_service_start(flag: str | None) -> dict:
+    status = cmd_service_status(flag)
+    if status["running"]:
+        return {**status, "already_running": True}
+    others = [cid for cid in _running_connections() if cid != status["connection"]]
+    if others:
+        _die(6, "service_running_elsewhere",
+             f"a daemon already runs in this project on connection {others[0]!r}",
+             f"`{NAME} service stop --connection {others[0]}` first: a connection change "
+             "needs a restart")
+    _refuse_profiles(_valid_settings())
+    argv, env, paths, resolved = _launch(flag)
+    nonce = env["TELEGRAM_BOT_LAUNCH_NONCE"]
+    with paths["log"].open("a", encoding="utf-8") as log:
+        proc = subprocess.Popen(argv, cwd=env["TELEGRAM_BOT_PROJECT_ROOT"], env=env,
+                                stdout=log, stderr=subprocess.STDOUT,
+                                stdin=subprocess.DEVNULL, start_new_session=True)
+    deadline = time.time() + 120   # a cold uv resolve of the runner takes a while
+    while time.time() < deadline and proc.poll() is None:
+        health = _read_json(paths["health"])
+        if isinstance(health, dict) and health.get("launch_nonce") == nonce:
+            if health.get("state") == "healthy":
+                return {**cmd_service_status(resolved["id"]), "started": True}
+            if health.get("state") in PARKED_STATES:
+                # Parked: up, but it will not poll. Started by hand, it is
+                # stopped and the reason given; a supervisor leaves it parked.
+                with __import__("contextlib").suppress(ProcessLookupError, TypeError):
+                    os.kill(int(health.get("pid")), signal.SIGTERM)
+                _die(2 if health["state"] == "token_refused" else 5,
+                     f"service_{health['state']}", str(health.get("problem") or
+                                                      health["state"]),
+                     f"`{NAME} doctor`")
+        time.sleep(0.5)
+    if proc.poll() is None:
+        with __import__("contextlib").suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGTERM)
+    tail = paths["log"].read_text(errors="replace").splitlines()[-8:] \
+        if paths["log"].exists() else []
+    _die(5, "service_start_failed",
+         f"the daemon exited with {proc.returncode}" if proc.poll() is not None
+         else "the daemon did not report healthy in time", "\n".join(tail) or None)
+
+
+PARKED_STATES = ("token_refused", "bot_mismatch", "conflict", "bot_locked",
+                 "profile_refused")
+
+
+def _proven_pid(status: dict) -> int | None:
+    health = status.get("health") or {}
+    pid = status.get("pid")
+    if pid and health.get("pid") != pid:
+        _die(6, "service_provenance_mismatch",
+             "pid file and health record name different processes; refusing to signal")
+    return pid
+
+
+def _kill_group(pid: int, sig: int) -> None:
+    """`sig` to the daemon's whole process group - `uv run`, the daemon it
+    started and the workers - falling back to the daemon alone."""
+    try:
+        os.killpg(os.getpgid(pid), sig)
+    except ProcessLookupError:
+        with __import__("contextlib").suppress(ProcessLookupError):
+            os.kill(pid, sig)
+
+
+def cmd_service_stop(flag: str | None, force: bool, timeout: float = 30.0) -> dict:
+    status = cmd_service_status(flag)
+    pid = _proven_pid(status)
+    if not status["running"]:
+        return {"stopped": False, "running": False, "connection": status["connection"]}
+    # The pid is the daemon's own, a child of `uv run` (the group leader `start`
+    # launched): SIGTERM goes to it alone, which cancels its turns and exits,
+    # and uv exits with it.
+    with __import__("contextlib").suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGTERM)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _pid_alive(pid):
+            return {"stopped": True, "running": False, "connection": status["connection"],
+                    "pid": pid}
+        time.sleep(0.2)
+    if force:
+        _kill_group(pid, signal.SIGKILL)
+        return {"stopped": True, "killed": True, "running": False,
+                "connection": status["connection"], "pid": pid}
+    _die(5, "service_stop_timeout", f"the daemon did not stop within {timeout:g}s",
+         f"`{NAME} service stop --force`")
+
+
+def cmd_service_reload(flag: str | None, timeout: float = 30.0) -> dict:
+    _refuse_profiles(_valid_settings())
+    status = cmd_service_status(flag)
+    if not status["running"]:
+        _die(5, "service_not_running", "the daemon is not running", f"`{NAME} service start`")
+    pid = _proven_pid(status)
+    own = _service_paths(status["connection"])["context"]
+    _write_private(own, _context_or_own_copy(own))
+    before = int((status.get("health") or {}).get("settings_reload_attempts") or 0)
+    os.kill(pid, signal.SIGHUP)   # the daemon alone, never its group: turns run there
+    health_path = _service_paths(status["connection"])["health"]
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        health = _read_json(health_path) or {}
+        if int(health.get("settings_reload_attempts") or 0) > before:
+            if health.get("settings_reload_error"):
+                _die(6, "service_reload_refused", health["settings_reload_error"],
+                     "the previous settings stay in force")
+            return {"reloaded": True, "pid": pid, "connection": status["connection"],
+                    "settings_fingerprint": health.get("settings_fingerprint")}
+        time.sleep(0.1)
+    _die(5, "service_reload_timeout", f"no acknowledgement within {timeout:g}s",
+         f"`{NAME} service logs`")
+
+
+def cmd_service_logs(flag: str | None, tail: int) -> dict:
+    status = cmd_service_status(flag)
+    log = Path(status["log_file"])
+    if not log.exists():
+        _die(3, "logs_not_found", f"no service log yet: {log}", f"`{NAME} service start`")
+    return {"connection": status["connection"], "log_file": str(log),
+            "lines": log.read_text(errors="replace").splitlines()[-max(0, tail):]}
+
+
+def cmd_service_settings_document() -> dict:
+    """The settings the daemon loads: the project's records over the global ones."""
+    return _service_settings()
+
+
+def cmd_service_context_document() -> dict:
+    """The context document the daemon reads for every turn."""
+    return {"body": _context_body()}
+
+
+def cmd_prompts(verb: str, args: list, version: str | None, base: str | None,
+                note: str | None, directory: str | None) -> dict:
+    """`prompts list|show|versions|put|import|export`, as upstream's
+    `telegram prompts`: the service's prompts as the store keeps them, one
+    version's text, a key's history, a new version, and the service folder's
+    files read in or written out."""
+    module = _prompts()
+    wanted = {"list": 0, "show": 1, "versions": 1, "put": 2, "import": 0, "export": 0}
+    if verb not in wanted:
+        _die(6, "input", f"unknown prompts verb {verb!r}",
+             "list, show, versions, put, import, export")
+    if len(args) != wanted[verb]:
+        _die(6, "input", f"usage: {NAME} prompts list | show <key> [--version ID] | "
+             "versions <key> | put <key> <file|-> [--base ID] [--note TEXT] | "
+             "import|export [--dir DIR]")
+    writing = verb in ("put", "import")
+    if writing:
+        _read_only_gate(f"`{NAME} prompts {verb}`")
+    if _project_root() is None:
+        _die(6, "project_required", "prompts are kept per project: run it inside one")
+    conn, project_id = _open_prompts(write=writing)
+    try:
+        if verb == "list":
+            return {"project_id": project_id, "prompts": module.keys(conn, project_id)}
+        if verb == "show":
+            row = (module.version(conn, project_id, args[0], version) if version
+                   else module.active(conn, project_id, args[0]))
+            if row is None:
+                _die(3, "not_found", f"no version {version} of {args[0]}" if version
+                     else f"the store holds no version of {args[0]}",
+                     f"`{NAME} prompts versions {args[0]}` lists them; "
+                     f"`{NAME} prompts import` reads the service folder's files")
+            return row
+        if verb == "versions":
+            found = module.versions(conn, project_id, args[0])
+            if not found:
+                _die(3, "not_found", f"the store holds no version of {args[0]}",
+                     f"`{NAME} prompts list` names the keys it holds")
+            return {"key": args[0], "versions": found}
+        if verb == "put":
+            try:
+                body = sys.stdin.read() if args[1] == "-" else Path(args[1]).read_text()
+            except (OSError, UnicodeDecodeError) as exc:
+                _die(6, "input", f"cannot read {args[1]}: {exc}")
+            row, saved = module.save(conn, project_id, args[0], body, _saver(),
+                                     note=note, base=base)
+            return {"key": args[0], "version": row["id"],
+                    "outcome": "saved" if saved else "unchanged"}
+        folder = (Path(directory).expanduser() if directory
+                  else _project_capabilities_dir(_project_root()) / NAME / "service")
+        if verb == "import":
+            if not folder.is_dir():
+                _die(6, "input", f"{folder} is not a directory")
+            try:
+                report = module.import_files(conn, project_id, folder, module.document_key,
+                                             _saver(), note=note)
+            except (OSError, UnicodeDecodeError) as exc:
+                _die(6, "input", f"cannot read a prompt file: {exc}")
+            return {"directory": str(folder), "prompts": report}
+        try:
+            report = module.export_files(conn, project_id, folder, module.document_key)
+        except OSError as exc:
+            _die(6, "input", f"cannot write into {folder}: {exc}")
+        return {"directory": str(folder), "prompts": report}
+    except module.PromptError as exc:
+        _die(6, exc.slug, exc.message, exc.hint)
+    finally:
+        conn.close()
+
+
+# --- Connections on another node ----------------------------------------------
+
+REMOTE_TIER = "remote"
+
+
+def _connection_add_remote(argv: list) -> None:
+    """`connection add <id> --remote ...`: the contract's own add, but for the
+    env keys `--env` names, which resolve on the node that runs the service (a
+    server keeps the token in its environment) and not on the machine that
+    writes the records. Each such key is recorded unchecked and reported as
+    `remote`; `doctor` on the node proves it."""
+    argv = [word for word in argv if word != "--remote"]
+    named = set()
+    for i, word in enumerate(argv):
+        pair = word[len("--env="):] if word.startswith("--env=") else (
+            argv[i + 1] if word == "--env" and i + 1 < len(argv) else None)
+        if pair and "=" in pair:
+            named.add(pair.split("=", 1)[1].strip())
+    if not named:
+        _die(6, "input", "--remote records the env key --env names without finding it here",
+             f"`{NAME} connection add <id> --remote --env secret_env=TELEGRAM_BOT_<ID>_TOKEN "
+             "--field username=<bot> --field expected_bot_id=<id>`")
+    local, emit = _resolve_env_key, _emit
+
+    def resolve(key):
+        found = local(key)
+        if found[0] or key not in named:
+            return found
+        return ("remote", REMOTE_TIER, None)
+
+    def report(value):
+        if isinstance(value, dict):
+            for row in value.get("fields") or []:
+                if row.get("tier") == REMOTE_TIER:
+                    row.update({"set": None, "value": None, "source": None,
+                                "note": "not set on this machine; resolved on the node "
+                                        "that runs the service"})
+            value["next"] = (f"on the node: `{NAME} doctor --connection "
+                             f"{value.get('connection')}` proves it")
+        emit(value)
+
+    globals()["_resolve_env_key"], globals()["_emit"] = resolve, report
+    _contract(argv)
+
+
+# --- Inventory -------------------------------------------------------------------
+
+def _inventory(_network: bool) -> dict:
+    """The daemon's state in this project, from its pid and health files; a
+    project that cannot select a connection says why instead of failing."""
+    import contextlib
+    import io
+    if _project_root() is None:
+        return {"service": {"state": "not configured", "detail": "not inside a project",
+                            "ok": False, "problem": "not inside a project"}}
+    try:
+        with contextlib.redirect_stderr(io.StringIO()) as refused:
+            status = cmd_service_status(None)
+            initialized = bool(_service_settings())
+    except SystemExit:
+        reason = "unknown"
+        for line in reversed(refused.getvalue().strip().splitlines()):
+            try:
+                reason = json.loads(line)["error"]["message"]
+                break
+            except (ValueError, KeyError, TypeError):
+                continue
+        return {"service": {"state": "not configured", "detail": reason, "ok": False,
+                            "problem": reason}}
+    health = status.get("health") or {}
+    if status["running"]:
+        ok = health.get("state") == "healthy"
+        return {"service": {"state": "running", "ok": ok,
+                            "detail": f"pid {status['pid']}, health {health.get('state')}, "
+                                      f"connection {status['connection']}",
+                            **({} if ok else {"problem": f"health {health.get('state')}"})}}
+    return {"service": {"state": "stopped" if initialized else "not initialized",
+                        "detail": f"connection {status['connection']}", "ok": initialized,
+                        **({} if initialized else {"problem": "the service is not initialized"})}}
+
+
+# --- Dispatch -------------------------------------------------------------------
+
+def _take(argv: list, flag: str, has_value: bool = True):
+    if flag in argv:
+        i = argv.index(flag)
+        if not has_value:
+            del argv[i]
+            return True
+        if i + 1 >= len(argv):
+            _die(6, "input", f"{flag} needs a value")
+        value = argv[i + 1]
+        del argv[i:i + 2]
+        return value
+    for i, word in enumerate(argv):
+        if has_value and word.startswith(flag + "="):
+            del argv[i]
+            return word.split("=", 1)[1]
+    return False if not has_value else None
+
+
+def _int_flag(argv: list, flag: str):
+    value = _take(argv, flag)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        _die(6, "input", f"{flag} takes an integer")
+
+
+def main() -> None:
+    _gate()
+    argv = sys.argv[1:]
+    if (argv[:1] or [""])[0] == "manifest":
+        _emit({**_manifest_core(), "service": SERVICE})
+        return
+    _refuse_project_secret(list(argv))
+    if argv[:2] == ["token", "set"]:
+        if len(argv) != 3:
+            _die(6, "input", "usage: token set <id>   (the token on stdin)")
+        _emit(cmd_token_set(argv[2], sys.stdin.read()))
+        return
+    if argv[:2] == ["connection", "add"] and "--remote" in argv:
+        _connection_add_remote(list(argv))
+    _contract(argv)
+    argv = list(argv)
+    wanted = _take(argv, "--connection")
+    if argv == ["doctor"]:
+        _emit(cmd_doctor(wanted))
+        return
+    if argv[:1] == ["send"]:
+        topic = _int_flag(argv, "--topic")
+        reply_to = _int_flag(argv, "--reply-to")
+        if len(argv) != 3:
+            _die(6, "input", "usage: send <chat_id> <text> [--topic N] [--reply-to MSG]")
+        _emit(cmd_send(wanted, argv[1], argv[2], topic, reply_to))
+        return
+    if argv[:1] == ["prompts"] and len(argv) >= 2:
+        rest = argv[2:]
+        version, base = _take(rest, "--version"), _take(rest, "--base")
+        note, directory = _take(rest, "--note"), _take(rest, "--dir")
+        _emit(cmd_prompts(argv[1], rest, version, base, note, directory))
+        return
+    if argv[:1] == ["service"] and len(argv) >= 2:
+        verb, rest = argv[1], argv[2:]
+        force = _take(rest, "--force", has_value=False)
+        tail = _int_flag(rest, "--tail")
+        if rest:
+            _die(6, "input", f"unexpected arguments: {' '.join(rest)}")
+        if verb == "init":
+            _emit(cmd_service_init(wanted, bool(force)))
+        elif verb == "doctor":
+            _emit(cmd_service_doctor(wanted))
+        elif verb == "run":
+            cmd_service_run(wanted)
+        elif verb == "start":
+            _emit(cmd_service_start(wanted))
+        elif verb == "stop":
+            _emit(cmd_service_stop(wanted, bool(force)))
+        elif verb == "reload":
+            _emit(cmd_service_reload(wanted))
+        elif verb == "status":
+            _emit(cmd_service_status(wanted))
+        elif verb == "logs":
+            _emit(cmd_service_logs(wanted, tail if tail is not None else 100))
+        elif verb == "settings-document":
+            _emit(cmd_service_settings_document())
+        elif verb == "context-document":
+            _emit(cmd_service_context_document())
+        else:
+            _die(6, "input", f"unknown service verb {verb!r}",
+                 "init, doctor, run, start, reload, stop, status, logs")
+        return
+    _die(6, "input", "unknown or incomplete command", f"run `{NAME} help`")
+
+
+if __name__ == "__main__":
+    main()

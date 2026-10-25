@@ -10,7 +10,11 @@
 # instead of the binds. This wrapper rewrites both: each stamped
 # `# >>> contract: <tier>` region becomes its bind call (the library executes
 # the tier in place, as the stamped text ran), and the declared library becomes
-# the manager's range.
+# the manager's range. A script that declares a higher floor under the same
+# ceiling keeps it, as the manager accepts any range that admits nothing older
+# than its own floor: a capability that needs a newer library (telegram-bot
+# needs 0.18, the first whose verb gate refuses `connections show --reveal`)
+# says so in its header.
 #
 # Usage: bin/sync-contract [--check]   (--check: report drift, exit 7, write nothing)
 set -euo pipefail
@@ -53,7 +57,21 @@ for script in sorted(root.glob("capabilities/*/bin/*")):
         drift[name] = "no PEP 723 block"
         continue
     block = meta.group(1)
-    if dep_re.search(block):
+    declared = dep_re.search(block)
+    def version(text):
+        return tuple(int(part) for part in text.split("."))
+    def bound(spec, op):
+        found = re.search(op + r"([0-9.]+)", spec)
+        return found.group(1) if found else None
+    raised = False
+    if declared:
+        have = declared.group(0)
+        hf, nf = bound(have, ">="), bound(want_range, ">=")
+        hc, nc = bound(have, "<"), bound(want_range, "<")
+        raised = bool(hf and nf and hc and hc == nc and version(hf) > version(nf))
+    if declared and raised:
+        new_block = block
+    elif declared:
         new_block = dep_re.sub(want, block)
     elif "# dependencies = [\n" in block:
         new_block = block.replace("# dependencies = [\n", f"# dependencies = [\n#     {want},\n", 1)
