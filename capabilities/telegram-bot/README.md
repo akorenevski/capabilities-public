@@ -4,6 +4,6 @@ One Telegram bot per project: the project's agent answers in the chats and forum
 
 By Alexander Korenevski, under the MIT licence in this repository's `LICENSE`.
 
-Derived from the `telegram` capability of [ai-cluster-one/capabilities](https://github.com/ai-cluster-one/capabilities) by Cluster One, under the MIT licence. Upstream's notice is kept whole in [`LICENSE-UPSTREAM`](LICENSE-UPSTREAM); [`UPSTREAM.md`](UPSTREAM.md) names the upstream commit and what was taken, verbatim or adapted.
+Derived from the `telegram` capability of [ai-cluster-one/capabilities](https://github.com/ai-cluster-one/capabilities) by Konstantin Žilin, under the MIT licence (copyright Cluster One). Upstream's notice is kept whole in [`LICENSE-UPSTREAM`](LICENSE-UPSTREAM); [`UPSTREAM.md`](UPSTREAM.md) names the upstream commit and what was taken, verbatim or adapted.
 
 Run `telegram-bot help` for the full usage contract and `telegram-bot guide enrol-a-bot` to set a bot up.

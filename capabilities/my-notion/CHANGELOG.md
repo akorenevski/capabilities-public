@@ -1,5 +1,9 @@
 # my-notion — change log
 
+## 2026-10-25 — Keeps the upstream licence notice
+
+`LICENSE-UPSTREAM` carries the MIT notice of the `notion` capability in `ai-cluster-one/capabilities` (copyright Cluster One), since 448 of its lines are still here verbatim; `README.md` points to it. Domain verbs are unchanged.
+
 ## 2026-10-25 — Names its authors
 
 Alexander Korenevski is named as the author (the CLI's header, `README.md`, `PROVENANCE.md`), and Konstantin Žilin as the author of the `notion` capability its first version started from. It stays an independent capability, not a fork. Domain verbs are unchanged.

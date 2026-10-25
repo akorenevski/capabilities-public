@@ -10,8 +10,8 @@
 and forum topics it is allowed into, beside people, other bots and a personal account.
 
 Author: Alexander Korenevski. MIT licence. Derived from the upstream `telegram`
-capability by Cluster One (MIT; its notice is kept in LICENSE-UPSTREAM, and UPSTREAM.md
-names the commit and what was taken). Where upstream signs a person's account in over MTProto, this speaks the
+capability by Konstantin Žilin (MIT, copyright Cluster One; its notice is kept in
+LICENSE-UPSTREAM, and UPSTREAM.md names the commit and what was taken). Where upstream signs a person's account in over MTProto, this speaks the
 Bot API with a bot token, so it reads no history and lists no dialogs: what the bot knows
 of a chat is what Telegram delivered to it while it ran.
 

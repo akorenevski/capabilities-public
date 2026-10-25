@@ -1,5 +1,9 @@
 # telegram-bot — change log
 
+## 0.7.3 — 2026-10-25
+
+- Konstantin Žilin is named as the author of the upstream `telegram` capability (the CLI's header and `README.md`); upstream's MIT notice (`LICENSE-UPSTREAM`, copyright Cluster One) and `UPSTREAM.md` are unchanged. Behaviour is unchanged.
+
 ## 0.7.2 — 2026-10-25
 
 - Published: the capability moves from the private source to `capabilities-public`, with `bin/carry-upstream` beside it. Alexander Korenevski is named as its author (the CLI's header and `README.md`), under the repository's MIT licence; upstream's MIT notice (`LICENSE-UPSTREAM`) and attribution (`UPSTREAM.md`) are unchanged.
