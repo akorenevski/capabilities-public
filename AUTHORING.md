@@ -14,6 +14,7 @@ capabilities new <name> --source capabilities-public
 The manager stamps generated contract regions from `contract/preamble.py`.
 Never edit text between `# >>> contract:` and `# <<< contract:` markers.
 Stamp them only with `bin/sync-contract`, then `bin/sync-contract --check`: besides the regions it aligns each script's `capabilities-contract==` pin with the installed manager's, which `capabilities sync-contract` and `capabilities audit` never look at, so new region code can otherwise run against an old library, or none.
+A script that needs a newer library than the manager's floor declares the higher floor under the manager's ceiling (`capabilities-contract>=0.18,<1` in telegram-bot, whose request gate needs 0.18's reveal check); `bin/sync-contract` keeps such a floor rather than lowering it, and the manager accepts it.
 Before every commit, stage the intended source files and derive the catalogue
 from that exact index:
 
