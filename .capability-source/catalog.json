@@ -2,7 +2,7 @@
   "capabilities": {
     "my-notion": {
       "path": "capabilities/my-notion",
-      "payload_sha256": "831369dc1d9c5ff20ce4586702493c38a6df8085efb0cb10f46e90c6ac8223ff",
+      "payload_sha256": "37d916f1e881a753ec6cbc601298e489dbc70b11f37ae19c92e71b10ac3883da",
       "summary": "Notion CLI over the REST API — pages AND databases. Publish markdown, create/upsert pages; create databases, add/query/update rows (data-source model, 2026-03-11), and archive. Personal, multi-workspace."
     },
     "telegram-bot": {

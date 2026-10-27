@@ -57,6 +57,12 @@ Commands — pages:
   my-notion whoami                             Identity + workspace.
   my-notion children <parent>                  List direct child pages.
   my-notion get <page>                         Fetch page as markdown (incl. title).
+                                              Blocks it cannot render (links,
+                                              bookmarks, embeds, unshared or
+                                              past ~20k records) come as
+                                              <unknown> tags and a stderr
+                                              warning with their ids; publish
+                                              keeps them while the tags stay.
   my-notion publish <page> [<md>|-]            Replace body + title of a page.
   my-notion append <page> [<md>|-]             Add markdown to the END of a page in
                                               ONE request. Body preserved, title
@@ -96,9 +102,12 @@ Commands — editing a page in place (blocks, ids and line comments survive):
   my-notion edit <page> --old <text> --new <md> [--old .. --new ..] [--all]
                                               Replace text. Each --old must
                                               match exactly once (--all: every
-                                              match); otherwise Notion refuses
-                                              and NOTHING changes. --new takes
-                                              markdown (**bold**, links).
+                                              match). When none matches nothing
+                                              changes; when only some do, those
+                                              are APPLIED and the rest are named
+                                              in a `partial_edit` error (exit 6).
+                                              --new takes markdown (**bold**,
+                                              links).
   my-notion insert <page> --after <text> [<md>|-]
                                               Insert markdown right after the
                                               line containing <text> (or a span
@@ -157,7 +166,8 @@ Commands — databases (data-source model, Notion-Version 2026-03-11):
                                               or a display name / email, which is
                                               resolved for you (see `users`).
   my-notion db-query <db> [--filter J] [--sorts J] [--limit N]
-                                              Query rows (returns flattened props).
+                                              Query rows (returns flattened props;
+                                              a date range is [start, end]).
                                               A row holding people also carries
                                               `people: {column: [{id, name}]}`
                                               beside `properties` — the ids the
@@ -241,7 +251,8 @@ Commands — comments, files:
                                               with block_id and block_text. One
                                               request per block, so slower.
   my-notion comment <page> <text> [--discussion <id>] [--block <id>]
-                                              Write a comment. Without
+                                              Write a comment (inline markdown:
+                                              **bold**, links). Without
                                               --discussion it opens a new thread;
                                               with it the comment REPLIES into
                                               that thread — where the person who
@@ -308,6 +319,11 @@ Page references:
 Markdown input:
   Any command that takes <md> accepts a file path, "-" for stdin, or no
   argument (defaults to stdin).
+
+Markdown write warnings:
+  Notion answers 200 even when it skipped syntax it does not take; its
+  `warnings` are returned in the answer of create, publish, append, insert
+  and edit. Tables (pipe or <table>) and ```mermaid code blocks are taken.
 
 Title handling:
   The local markdown file is the source of truth for both the title and the
@@ -546,8 +562,12 @@ def _read_md(arg: str | None) -> str:
         p = Path(arg)
         if p.exists():
             return p.read_text(encoding="utf-8")
+        # A URL is content, not a path: "see https://x" in the first 40
+        # characters was refused as a missing file (measured 2026-10-27).
         looks_like_a_path = ("\n" not in arg and len(arg) < 256
-                             and (arg.endswith(".md") or "/" in arg[:40]))
+                             and "://" not in arg
+                             and (arg.endswith(".md")
+                                  or arg.startswith(("/", "./", "../", "~/"))))
     except OSError:
         looks_like_a_path = False
     if looks_like_a_path:
@@ -798,12 +818,41 @@ def cmd_children(c: httpx.Client, parent: str) -> list[dict]:
     return results
 
 
+def _warn(code: str, message: str, **extra) -> None:
+    """A fact the caller must see beside a successful answer, on stderr."""
+    sys.stderr.write(json.dumps({"warning": {"code": code, "message": message,
+                                             **extra}}, ensure_ascii=False) + "\n")
+
+
+def _markdown_warnings(data: dict) -> list:
+    """Notion's `warnings` on a markdown write: syntax it did not take, edits
+    it skipped. The write still answers 200, so dropping them is how a table or
+    a replacement silently fails to land."""
+    return [{"code": w.get("code"), "message": w.get("message")}
+            for w in (data.get("warnings") or [])]
+
+
 def cmd_get(c: httpx.Client, page: str) -> str:
     page_id = _to_uuid(page)
     page_data = _request(c, "GET", f"/pages/{page_id}")
     title = _page_title(page_data)
     data = _request(c, "GET", f"/pages/{page_id}/markdown")
     md = data.get("markdown", "")
+    # A page past ~20,000 records, children this token cannot see, and block
+    # types the markdown API does not render (link_to_page, bookmark, embed)
+    # come back as <unknown> tags. Publishing the read back with the tags in
+    # place keeps those blocks (measured 2026-10-27); a reader who takes the
+    # markdown for the whole page does not know that, so it is said.
+    unknown = data.get("unknown_block_ids") or []
+    if data.get("truncated") or unknown:
+        _warn("truncated" if data.get("truncated") else "unknown_blocks",
+              "blocks shown as <unknown> are not in this markdown (page too "
+              "large, not shared with this token, or a type the markdown API "
+              "does not render: link, bookmark, embed); keep their tags when "
+              "publishing it back, and read them with `blocks`",
+              unknown_block_ids=unknown)
+    if page_data.get("in_trash"):
+        _warn("in_trash", "this page is in the trash")
     return _compose_with_h1(title, md) if title else md
 
 
@@ -824,9 +873,13 @@ def cmd_append(c: httpx.Client, page: str, md: str) -> dict:
     page_id = _to_uuid(page)
     data = _request(c, "PATCH", f"/pages/{page_id}/markdown",
                     {"type": "insert_content", "insert_content": {"content": md}})
+    warnings = _markdown_warnings(data)
     if data.get("object") != "page":
         data = _request(c, "GET", f"/pages/{page_id}")
-    return _page_summary(data, action="appended")
+    out = _page_summary(data, action="appended")
+    if warnings:
+        out["warnings"] = warnings
+    return out
 
 
 def cmd_publish(c: httpx.Client, page: str, md: str) -> dict:
@@ -835,7 +888,11 @@ def cmd_publish(c: httpx.Client, page: str, md: str) -> dict:
 
     body_patch = {"type": "replace_content",
                   "replace_content": {"new_str": body_md}}
-    data = _request(c, "PATCH", f"/pages/{page_id}/markdown", body_patch)
+    data = _request(c, "PATCH", f"/pages/{page_id}/markdown", body_patch,
+                    validation_hint="a page's child pages and databases are "
+                    "kept only as the <page>/<database> tags `get` returns; "
+                    "publish the body with those tags in it")
+    warnings = _markdown_warnings(data)
     if data.get("object") != "page":
         data = _request(c, "GET", f"/pages/{page_id}")
 
@@ -847,7 +904,10 @@ def cmd_publish(c: httpx.Client, page: str, md: str) -> dict:
                  "this should not happen for normal pages; check the page id")
         data = _request(c, "PATCH", f"/pages/{page_id}",
                         _title_property_body(prop_key, h1_title))
-    return _page_summary(data, action="updated")
+    out = _page_summary(data, action="updated")
+    if warnings:
+        out["warnings"] = warnings
+    return out
 
 
 # --- edits in place -----------------------------------------------------------
@@ -874,8 +934,23 @@ def cmd_edit(c: httpx.Client, page: str, pairs: list[tuple[str, str]],
     data = _request(c, "PATCH", f"/pages/{page_id}/markdown",
                     {"type": "update_content",
                      "update_content": {"content_updates": updates}})
-    return {"object": "page", "page_id": page_id, "replaced": len(updates),
-            "markdown": data.get("markdown"), "action": "edited"}
+    # Notion refuses only when NO --old matches. With several, the ones that
+    # match are applied and each miss comes back as a `no_match` warning on a
+    # 200 (measured 2026-10-27), so a half-done edit used to read as done.
+    warnings = _markdown_warnings(data)
+    missed = [w for w in warnings if w.get("code") == "no_match"]
+    if missed:
+        _die(6, "partial_edit",
+             f"{len(updates) - len(missed)} of {len(updates)} replacements "
+             f"were applied; these did not match: "
+             + "; ".join(w.get("message") or "" for w in missed),
+             "the matched ones are already on the page; fix the missing --old "
+             "texts (they must match the page exactly) and run only those")
+    out = {"object": "page", "page_id": page_id, "replaced": len(updates),
+           "markdown": data.get("markdown"), "action": "edited"}
+    if warnings:
+        out["warnings"] = warnings
+    return out
 
 
 def cmd_insert(c: httpx.Client, page: str, after: str, md: str) -> dict:
@@ -888,8 +963,11 @@ def cmd_insert(c: httpx.Client, page: str, after: str, md: str) -> dict:
     data = _request(c, "PATCH", f"/pages/{page_id}/markdown",
                     {"type": "insert_content",
                      "insert_content": {"content": md, "after": after}})
-    return {"object": "page", "page_id": page_id,
-            "markdown": data.get("markdown"), "action": "inserted"}
+    out = {"object": "page", "page_id": page_id,
+           "markdown": data.get("markdown"), "action": "inserted"}
+    if warnings := _markdown_warnings(data):
+        out["warnings"] = warnings
+    return out
 
 
 _INLINE = re.compile(r"(\*\*.+?\*\*|~~.+?~~|`[^`]+`|\[[^\]]+\]\([^)\s]+\)"
@@ -1012,7 +1090,10 @@ def cmd_create(c: httpx.Client, parent: str,
         "markdown": body_md,
     }
     data = _request(c, "POST", "/pages", body)
-    return _page_summary(data, action="created")
+    out = _page_summary(data, action="created")
+    if warnings := _markdown_warnings(data):
+        out["warnings"] = warnings
+    return out
 
 
 def cmd_upsert(c: httpx.Client, parent: str,
@@ -1310,7 +1391,14 @@ def _flatten_props(props: dict) -> dict:
         elif t == "multi_select":
             out[k] = [o.get("name") for o in (val or [])]
         elif t == "date":
-            out[k] = (val or {}).get("start") if val else None
+            # A range reads as [start, end], the shape db-update writes back;
+            # reading only the start dropped every end date.
+            if not val:
+                out[k] = None
+            elif val.get("end"):
+                out[k] = [val.get("start"), val.get("end")]
+            else:
+                out[k] = val.get("start")
         elif t == "people":
             out[k] = [pp.get("name") or pp.get("id") for pp in (val or [])]
         elif t == "relation":
@@ -1562,7 +1650,11 @@ def _shape_value(kind: str, value):
         return {"title": [], "rich_text": [], "multi_select": [], "people": [],
                 "relation": [], "select": None, "status": None, "date": None}.get(kind)
     if kind in ("title", "rich_text"):
-        return [{"text": {"content": str(value)}}]
+        # Notion caps one text object at 2,000 characters; a longer value goes
+        # as several, which it joins back (up to 100 of them).
+        text = str(value)
+        return [{"text": {"content": text[i:i + 2000]}}
+                for i in range(0, len(text), 2000)] or [{"text": {"content": ""}}]
     if kind in ("select", "status"):
         return {"name": str(value)}
     if kind == "multi_select":
@@ -2077,8 +2169,10 @@ def cmd_comment(c: httpx.Client, page: str, text: str,
     to it. Without it a reply to someone's question lands as a separate thread,
     and the person does not find it where they asked.
     """
-    body: dict = {"rich_text": [{"text": {"content": text[i:i + 1900]}}
-                                for i in range(0, len(text[:6000]), 1900)]}
+    # Notion's `markdown` body: inline formatting renders, and no length cap of
+    # ours. The rich_text form this replaced cut every comment past ~7,600
+    # characters without a word, and showed **bold** as asterisks.
+    body: dict = {"markdown": text}
     if discussion and block:
         _die(6, "input", "--discussion and --block are exclusive",
              "a reply lands in its thread's own anchor; --block starts a new "
@@ -2118,7 +2212,7 @@ def cmd_comment_edit(c: httpx.Client, comment: str, text: str) -> dict:
     As with deleting, Notion lets a token edit only the comments it wrote."""
     cid = _to_uuid(comment)
     data = _request(c, "PATCH", f"/comments/{cid}",
-                    {"rich_text": _rich_text(text[:6000])},
+                    {"markdown": text},
                     not_found_hint="no such comment, or it was written by "
                                    "another token: Notion lets a token edit "
                                    "only its own comments")
@@ -2293,19 +2387,33 @@ def cmd_download(c: httpx.Client, page: str, dest: str) -> dict:
     import pathlib as _pl
     d = _pl.Path(dest).expanduser()
     d.mkdir(parents=True, exist_ok=True)
-    got = []
+    from urllib.parse import unquote
+    got, failed, taken = [], [], set()
     for f in cmd_files(c, page)["files"]:
         if not f["url"]:
+            failed.append({"block_id": f["block_id"], "reason": "no url"})
             continue
         r = httpx.get(f["url"], timeout=TIMEOUT, follow_redirects=True)
         if r.status_code >= 300:
+            failed.append({"block_id": f["block_id"],
+                           "reason": f"HTTP {r.status_code}"})
             continue
-        name = f["url"].split("?")[0].rsplit("/", 1)[-1] or f["block_id"]
+        name = unquote(f["url"].split("?")[0].rsplit("/", 1)[-1]) or f["block_id"]
+        # Two attachments with one name used to land on one path, the second
+        # overwriting the first while both were reported saved.
+        if name in taken:
+            stem, dot, ext = name.rpartition(".")
+            name = (f"{stem}-{f['block_id'][-8:]}.{ext}" if dot
+                    else f"{name}-{f['block_id'][-8:]}")
+        taken.add(name)
         out = d / name
         out.write_bytes(r.content)
         got.append({"block_id": f["block_id"], "path": str(out),
                     "bytes": len(r.content), "caption": f["caption"]})
-    return {"page_id": _to_uuid(page), "saved": len(got), "files": got}
+    res = {"page_id": _to_uuid(page), "saved": len(got), "files": got}
+    if failed:
+        res["failed"] = failed
+    return res
 
 
 # --- CLI ---------------------------------------------------------------------
