@@ -1,5 +1,9 @@
 # my-notion — change log
 
+## 0.1.0 — 2026-10-27 — page-meta moves pages through the move endpoint
+
+`page-meta --parent` failed every move with `move_did_not_take`: it reparented through `PATCH /v1/pages/{id}` with a `parent`, which Notion answers with 200 and ignores, even for a page the integration had just created directly under a page. The move now goes through `POST /v1/pages/{id}/move`; the rename stays on `PATCH`, and the move is still judged on the page read back afterwards. The `move_did_not_take` hint no longer blames block-nested pages; it points at edit access, the app and `link`. This entry starts the version line.
+
 ## 2026-10-25 — Keeps the upstream licence notice
 
 `LICENSE-UPSTREAM` carries the MIT notice of the `notion` capability in `ai-cluster-one/capabilities` (copyright Cluster One), since 448 of its lines are still here verbatim; `README.md` points to it. Domain verbs are unchanged.

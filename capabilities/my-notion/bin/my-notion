@@ -81,8 +81,9 @@ Commands — pages:
                                               integration, newest edit first.
   my-notion page-meta <page> [--parent P] [--title T]
                                               Move a page (with its subpages)
-                                              under another page, and/or rename
-                                              it. Read back after the move; a
+                                              under another page (Notion's move
+                                              endpoint), and/or rename it. Read
+                                              back after the move; a
                                               page Notion did not move is
                                               reported, not called "moved".
   my-notion link <page> <target>               Put a link to <target> on <page>;
@@ -1434,11 +1435,8 @@ def cmd_db_meta(c: httpx.Client, db: str, parent: str | None,
 def cmd_link(c: httpx.Client, parent: str, target: str) -> dict:
     """Put a native link-to-page block on a page, pointing at another page.
 
-    The answer to a page that cannot be moved. Notion reparents a page whose
-    parent is a page, a database or the workspace; a page nested inside a block
-    — which is what a column layout on a teamspace home produces — is refused
-    silently, `PATCH /v1/pages` answering 200 with the parent unchanged. That is
-    not a bug we can wait out: some pages predate us and belong where they are.
+    The answer to a page that should appear in two places, or that the move
+    endpoint does not move: some pages predate us and belong where they are.
 
     A `link_to_page` block renders exactly like a child page in the parent's
     body, so the page appears where it is wanted while continuing to live where
@@ -1466,10 +1464,14 @@ def cmd_page_meta(c: httpx.Client, page: str, parent: str | None,
                   title: str | None) -> dict:
     """Move a page under another page, and/or rename it.
 
-    The sibling of `db-meta`, for the other object type, on the endpoint that
-    stands for it: `PATCH /v1/pages/{id}`. It existed as a gap rather than a
-    decision — a database could be reparented from the CLI and a page could
-    not, so moving a project page under HQ meant doing it by hand in the app.
+    The sibling of `db-meta`, for the other object type. It existed as a gap
+    rather than a decision — a database could be reparented from the CLI and a
+    page could not, so moving a project page under HQ meant doing it by hand.
+
+    The move goes through `POST /v1/pages/{id}/move`; the rename through
+    `PATCH /v1/pages/{id}`. Measured 2026-10-27: `PATCH` with a `parent` answers
+    200 and leaves the parent unchanged on every page, even one the integration
+    had just created directly under a page, so it never moves anything.
 
     A page carries its children with it, so this moves a whole subtree. That is
     also why the destination is checked first: a 404 from the PATCH itself
@@ -1499,7 +1501,6 @@ def cmd_page_meta(c: httpx.Client, page: str, parent: str | None,
                  data.get("code", "parent_unreachable"),
                  data.get("message", f"GET /pages/{parent_id} returned {status}"),
                  "the page was NOT moved", status=status)
-        body["parent"] = {"type": "page_id", "page_id": parent_id}
     if title is not None:
         status, current = _try_get(c, f"/pages/{page_id}")
         if status >= 400:
@@ -1516,10 +1517,14 @@ def cmd_page_meta(c: httpx.Client, page: str, parent: str | None,
                  "for a database row use db-update, which knows the schema")
         body["properties"] = {title_key: {"title": [{"type": "text",
                                                      "text": {"content": title}}]}}
-    _request(c, "PATCH", f"/pages/{page_id}", body)
+    if parent is not None:
+        _request(c, "POST", f"/pages/{page_id}/move",
+                 {"parent": {"type": "page_id", "page_id": parent_id}})
+    if body:
+        _request(c, "PATCH", f"/pages/{page_id}", body)
 
     # Read the page back and judge the MOVE on what the page says afterwards,
-    # never on the PATCH's own echo. Measured 2026-09-06: a page living inside a
+    # never on the write's own echo. Measured 2026-09-06: a page living inside a
     # block rather than directly under a page took the PATCH with 200 and the
     # parent unchanged, so the first version of this verb reported "moved" about
     # a page that had not moved. A write verb that reports success from the
@@ -1541,9 +1546,10 @@ def cmd_page_meta(c: httpx.Client, page: str, parent: str | None,
             _die(5, "move_did_not_take",
                  f"Notion accepted the request and the page is still under "
                  f"{now_parent.get('type')} {landed}, not under {parent_id}",
-                 "a page nested inside a block, or in another teamspace, cannot "
-                 "be reparented through the API — move it in the app and re-run "
-                 "the check", status=200)
+                 "check that the integration can edit both the page and the "
+                 "destination; if it can, move it in the app, or use "
+                 "`my-notion link` to show it there without moving it",
+                 status=200)
     if title is not None:
         actions.append("renamed")
     out["action"] = "+".join(actions)
