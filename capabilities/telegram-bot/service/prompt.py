@@ -70,6 +70,25 @@ def cut_at_reply_marker(reply):
         return reply, "mislabelled"
     return after, "marked"
 
+# Ours: the marker as models actually write it — bolded, with a colon, or inside
+# a line («**=== REPLY ===**», «=== REPLY ===:», «… === REPLY === …»). Live in
+# topic 141 such variants went out with the working-out above them (2026-11-03).
+LOOSE_REPLY_MARKER = re.compile(r"\**[ \t]*===[ \t]*REPLY[ \t]*===[ \t]*\**[ \t]*:?")
+
+
+def cut_reply(reply):
+    """`(text, outcome)` like `cut_at_reply_marker`, but the marker is found in
+    any of the shapes `LOOSE_REPLY_MARKER` knows, and a marker with nothing under
+    it is silence. A reply with no marker at all goes out as it is."""
+    matches = list(LOOSE_REPLY_MARKER.finditer(reply))
+    if not matches:
+        return reply, "unmarked"
+    after = reply[matches[-1].end():].strip()
+    if not after:
+        return "", "mislabelled"
+    return after, "marked"
+
+
 CONVERSATION_END = "--- END OF CONVERSATION ---"
 
 

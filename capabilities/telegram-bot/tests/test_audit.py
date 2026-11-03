@@ -520,10 +520,12 @@ class Request(unittest.TestCase):
 
 class Notices(unittest.TestCase):
     def test_failure_detail_only_for_a_supervisor(self):
+        # Anyone else hears nothing: live 2026-10-31 both project bots posted
+        # «Something went wrong…» into the topic.
         fail = lambda *a: {"ok": False, "answer": "", "kind": "timeout", "reason": "x"}  # noqa
         s, api = service(with_bob(), worker=fail)
         s.handle_update(update(addressed("go", sender=BOB)))
-        self.assertEqual(api.sent[-1]["text"], daemon.GENERIC_FAILURE_NOTICE)
+        self.assertEqual(api.sent, [])
         s.handle_update(update(addressed("go")))
         self.assertIn("timeout", api.sent[-1]["text"])
 

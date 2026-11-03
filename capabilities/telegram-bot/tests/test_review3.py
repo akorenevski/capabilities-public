@@ -384,7 +384,7 @@ class Restricted(unittest.TestCase):
                 else (None, "not found")
         seen, api = self.run_as(BOB, restricted=restricted)
         self.assertNotIn("knobs", seen)
-        self.assertEqual(api.sent[-1]["text"], daemon.GENERIC_FAILURE_NOTICE)
+        self.assertEqual(api.sent, [], "a refusal is the log's, not the chat's")
 
     def test_a_policy_may_lift_it(self):
         cfg = seeded()

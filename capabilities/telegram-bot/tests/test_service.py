@@ -128,6 +128,16 @@ class Turns(unittest.TestCase):
         s.handle_update(update(addressed("ok?")))
         self.assertEqual(api.sent, [])
 
+    def test_loose_marker_is_cut_and_never_reaches_the_chat(self):
+        # Live, 0.7.4: «**=== REPLY ===**» and «=== REPLY ===:» went out with the reasoning.
+        for answer in ("working it out\n**=== REPLY ===**\nall green",
+                       "working it out\n=== REPLY ===:\nall green",
+                       "working it out. === REPLY === all green"):
+            s, api = service(worker=lambda *a, answer=answer: {
+                "ok": True, "answer": answer, "kind": None, "reason": None})
+            s.handle_update(update(addressed("status?")))
+            self.assertEqual([m["text"] for m in api.sent], ["all green"], answer)
+
     def test_redelivered_update_is_answered_once(self):
         s, api = service()
         u = update(addressed())

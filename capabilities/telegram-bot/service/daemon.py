@@ -142,8 +142,6 @@ PROFILE_ENV = "TELEGRAM_BOT_SERVICE_PROFILE"
 TOKEN_ENV = "TELEGRAM_BOT_SERVICE_TOKEN"
 WORKER_BIN = HERE / "worker-bin"
 FAILURE_NOTICE = "The turn did not complete ({kind}). Nothing was sent beyond this note."
-GENERIC_FAILURE_NOTICE = ("Something went wrong while processing this. "
-                          "Please tell an administrator.")
 STOPPED_BY_NOTICE = "This request was stopped by {name} before it was answered."
 PARTIAL_NOTICE = ("The answer could not be sent in full ({sent} of {total} parts arrived). "
                   "Ask again if the rest is needed.")
@@ -1445,7 +1443,9 @@ class Service:
         (upstream shows the detail to a supervisor only)."""
         if _mapping(decision.get("sender")).get("role") == "supervisor":
             return FAILURE_NOTICE.format(kind=kind)
-        return GENERIC_FAILURE_NOTICE
+        # Anyone else hears nothing: an internal error is the log's, not the
+        # chat's (live 2026-10-31, «Something went wrong…» from both project bots).
+        return ""
 
     def _turn_files(self, decision: dict, ctx: dict) -> dict:
         """The turn's authority file, progress outbox and settings file, owner-only."""
@@ -1596,11 +1596,9 @@ class Service:
             return self.deliver(decision, target,
                                 self.failure_notice(decision, result.get("kind") or "error"),
                                 markdown=False)
-        answer, outcome = prompting.cut_at_reply_marker(result.get("answer") or "")
-        if outcome == "mislabelled":
-            # Unlike upstream, a marker with nothing under it is silence: what
-            # stands above a marker is working-out and never reaches the chat.
-            answer = ""
+        # Unlike upstream, the marker is found in its loose shapes and a marker
+        # with nothing under it is silence (prompting.cut_reply).
+        answer, outcome = prompting.cut_reply(result.get("answer") or "")
         log(f"{key} #{decision['message_id']}: {name} answered in {seconds}s ({outcome}"
             + (", restricted" if restricted else "") + ")")
         if not answer.strip():
@@ -1616,6 +1614,8 @@ class Service:
         better than a duplicate, and the log says it is not sure it arrived.
         A notice (`markdown` false) is escaped, never read as Markdown: it
         carries names the service did not write."""
+        if not text.strip():
+            return {"sent": [], "silent": True}
         key = decision["key"]
         mark = gate.NO_REPLY_MARKER if decision.get("external") else None
         reserve = len(f"\n\n{mark}") if mark else 0

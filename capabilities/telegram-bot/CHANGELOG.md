@@ -1,5 +1,10 @@
 # telegram-bot — change log
 
+## 0.7.5 — 2026-11-03
+
+- The reply marker is found as models write it: bolded (`**=== REPLY ===**`), with a colon, or inside a line; only the text after it is sent. Live in Blues Bros topic 141 such variants went out with the working-out above them.
+- A failed turn tells only a supervisor what failed; anyone else hears nothing, and the failure stays in the log. Live 2026-10-31 both project bots posted «Something went wrong while processing this» into the topic.
+
 ## 0.7.4 — 2026-10-25
 
 - A `=== REPLY ===` marker with nothing under it is silence: nothing is sent, and text above the marker is never sent in any case. Live in a forum topic, a turn that decided to stay silent posted its reasoning with the bare marker. Upstream's `cut_at_reply_marker` is unchanged; the daemon drops its `mislabelled` result.
