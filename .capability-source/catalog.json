@@ -10,7 +10,7 @@
     "telegram-bot": {
       "icon": false,
       "path": "capabilities/telegram-bot",
-      "payload_sha256": "6ae428091a386ce14be6aea56abe436b99edab1dcf30e233b5b56be9b4edcc6d",
+      "payload_sha256": "1eddea3e3e1bc3f38a18f13ae97bd85a09f8e056466905a42253962b87e9286e",
       "store_major": 1,
       "summary": "One Telegram bot per project: the project's agent answers in allowed chats and forum topics when addressed (mention, reply, /command@bot), with a bot-to-bot loop guard. Bot API; derived from upstream telegram."
     }
