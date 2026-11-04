@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.18,<1",
+#     "capabilities-contract>=0.38,<1",
 #     "callva-harness-runner==0.10.1",
 # ]
 # ///
