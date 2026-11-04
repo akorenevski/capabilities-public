@@ -448,24 +448,23 @@ def _project_settings() -> dict:
 # --- Credentials -------------------------------------------------------------
 
 def _load_token(key: str = "NOTION_TOKEN") -> str:
-    """Resolve a PAT by env-var NAME through the credential cascade — a project
-    .env(.local), then ~/.config/my-notion/credentials.env, then the process env;
-    first non-empty wins. `key` defaults to NOTION_TOKEN; the global
+    """Resolve a PAT by env-var NAME through the same credential cascade as
+    doctor and connections — the agent's vault and the env tiers; first
+    non-empty wins. `key` defaults to NOTION_TOKEN; the global
     `--token-env <KEY>` flag selects an alternate key to act as another identity.
     The token value never travels on the command line — only its name (so there is
     no value flag tier; the secret stays off argv, deliberately)."""
-    tok = (_project_env().get(key)
-           or _parse_env_file(CREDENTIALS_ENV).get(key)
-           or os.environ.get(key)
-           or "").strip()
+    # The same resolver doctor and connections use, so a token sealed in the
+    # agent's vault reaches the data verbs too, not only the readiness check.
+    tok = (_resolve_env_key(key)[0] or "").strip()
     if tok:
         return tok
     if key == "NOTION_TOKEN":
         _die(2, "missing_token",
-             f"NOTION_TOKEN not found in a project .env, {CREDENTIALS_ENV}, or the environment",
+             f"NOTION_TOKEN not found in the vault, a project .env, {CREDENTIALS_ENV}, or the environment",
              "add NOTION_TOKEN=<your PAT> to the user config or a project .env")
     _die(2, "missing_token",
-         f"{key} not found in a project .env, {CREDENTIALS_ENV}, or the environment",
+         f"{key} not found in the vault, a project .env, {CREDENTIALS_ENV}, or the environment",
          f"add {key}=<PAT> to the user config or a project .env to use --token-env {key}")
 
 
