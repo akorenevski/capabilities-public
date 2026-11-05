@@ -2,9 +2,11 @@
 
 Adapted from upstream's `service/prompts.py` (UPSTREAM.md): its functions are
 upstream's but for the table, which is this capability's own
-(`telegrambot_prompts`, under the ledger owner `telegrambot`, migrated by
-`open_store`), so a project that runs upstream's `telegram` beside its bot keeps
-two `context` prompts, one for each. The service has one prompt today,
+(`tgbot_prompts`, under the ledger owner `tgbot`, migrated by `open_store`), so
+a project that runs upstream's `telegram` or `telegrambot` beside its bot keeps
+a `context` prompt for each. Up to 0.7.8 it was `telegrambot_prompts` under the
+owner `telegrambot`, the names official `telegrambot` takes; the step moves its
+rows here and drops it. The service has one prompt today,
 `context`, read for every turn; each save is a new row, exactly one row per
 project and key is active, and the store refuses any change to a row but
 clearing `active`, so every earlier version stays readable as it was.
@@ -25,8 +27,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable
 
-TABLE = "telegrambot_prompts"
-STORE_OWNER = "telegrambot"
+TABLE = "tgbot_prompts"
+STORE_OWNER = "tgbot"
 STORE_SCHEMA_MAJOR = 1
 STORE_SCHEMA_MINOR = 0
 # Where a key's file sits under a service directory: `context.<x>` in
@@ -44,10 +46,11 @@ class PromptError(Exception):
         self.slug, self.message, self.hint = slug, message, hint
 
 
-# Upstream's step `0005-prompts`, under this capability's own names.
+# Upstream's step `0005-prompts`, under this capability's own names, and the
+# move off the names official `telegrambot` takes.
 STORE_STEPS = (
     ("0001-prompts", """
-    CREATE TABLE telegrambot_prompts (
+    CREATE TABLE tgbot_prompts (
         id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
         project_id  text NOT NULL CHECK (project_id <> ''),
         key         text NOT NULL CHECK (key ~ '^[^/[:space:]]+$' AND key !~ '^reference[.]'),
@@ -57,24 +60,24 @@ STORE_STEPS = (
         created_by  text NOT NULL CHECK (created_by <> ''),
         note        text
     );
-    CREATE UNIQUE INDEX telegrambot_prompts_active ON telegrambot_prompts (project_id, key)
+    CREATE UNIQUE INDEX tgbot_prompts_active ON tgbot_prompts (project_id, key)
         WHERE active;
-    CREATE INDEX telegrambot_prompts_key ON telegrambot_prompts (project_id, key, created_at DESC);
-    COMMENT ON TABLE telegrambot_prompts IS
+    CREATE INDEX tgbot_prompts_key ON tgbot_prompts (project_id, key, created_at DESC);
+    COMMENT ON TABLE tgbot_prompts IS
         'Every saved version of a telegram-bot service prompt; immutable but for active, which a save clears as it adds the next.';
-    COMMENT ON COLUMN telegrambot_prompts.project_id IS
+    COMMENT ON COLUMN tgbot_prompts.project_id IS
         'The project''s declared id.';
-    COMMENT ON COLUMN telegrambot_prompts.key IS
+    COMMENT ON COLUMN tgbot_prompts.key IS
         'The document key: the service file''s name without .md, lower-cased with _ as -.';
-    COMMENT ON COLUMN telegrambot_prompts.body IS
+    COMMENT ON COLUMN tgbot_prompts.body IS
         'The prompt''s whole text, kept exactly.';
-    COMMENT ON COLUMN telegrambot_prompts.active IS
+    COMMENT ON COLUMN tgbot_prompts.active IS
         'The version the service reads; at most one per project and key.';
-    COMMENT ON COLUMN telegrambot_prompts.created_by IS
+    COMMENT ON COLUMN tgbot_prompts.created_by IS
         'Who saved the version: user@node, or the verb that seeded it.';
-    COMMENT ON COLUMN telegrambot_prompts.note IS
+    COMMENT ON COLUMN tgbot_prompts.note IS
         'Why the version was saved.';
-    CREATE FUNCTION telegrambot_prompts_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+    CREATE FUNCTION tgbot_prompts_guard() RETURNS trigger LANGUAGE plpgsql AS $$
     BEGIN
         IF tg_op IN ('DELETE', 'TRUNCATE') THEN
             RAISE EXCEPTION 'telegram-bot prompt versions are never deleted: save a new version'
@@ -90,10 +93,28 @@ STORE_STEPS = (
         END IF;
         RETURN new;
     END $$;
-    CREATE TRIGGER telegrambot_prompts_guard BEFORE UPDATE OR DELETE ON telegrambot_prompts
-        FOR EACH ROW EXECUTE FUNCTION telegrambot_prompts_guard();
-    CREATE TRIGGER telegrambot_prompts_truncate BEFORE TRUNCATE ON telegrambot_prompts
-        FOR EACH STATEMENT EXECUTE FUNCTION telegrambot_prompts_guard();
+    CREATE TRIGGER tgbot_prompts_guard BEFORE UPDATE OR DELETE ON tgbot_prompts
+        FOR EACH ROW EXECUTE FUNCTION tgbot_prompts_guard();
+    CREATE TRIGGER tgbot_prompts_truncate BEFORE TRUNCATE ON tgbot_prompts
+        FOR EACH STATEMENT EXECUTE FUNCTION tgbot_prompts_guard();
+    DO $$
+    BEGIN
+        -- Up to 0.7.8 this table was `telegrambot_prompts` under the ledger
+        -- owner `telegrambot`: the names official `telegrambot` takes in its
+        -- step 0003-prompts. Its versions move here and the old table and
+        -- function go, so that step can run. A `telegrambot_prompts` keyed by
+        -- agent_id is official telegrambot's own and is left alone.
+        IF EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_schema = current_schema()
+                     AND table_name = 'telegrambot_prompts'
+                     AND column_name = 'project_id') THEN
+            INSERT INTO tgbot_prompts (id, project_id, key, body, active, created_at, created_by, note)
+                SELECT id, project_id, key, body, active, created_at, created_by, note
+                FROM telegrambot_prompts;
+            DROP TABLE telegrambot_prompts;
+            DROP FUNCTION IF EXISTS telegrambot_prompts_guard();
+        END IF;
+    END $$;
     """),
 )
 

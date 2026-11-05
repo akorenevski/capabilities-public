@@ -1,5 +1,9 @@
 # telegram-bot — change log
 
+## 0.7.9 — 2026-11-05
+
+- The prompts move off the names official `telegrambot` takes: the table is `tgbot_prompts` under the ledger owner `tgbot`, no longer `telegrambot_prompts` under `telegrambot`. The first open of a store moves every version from the old table, keeping ids, dates and the active one, and drops the old table and its guard function, so official `telegrambot`'s step `0003-prompts` can run on the same store (it failed on all-stars, 05.11). A `telegrambot_prompts` keyed by `agent_id` is official telegrambot's own and is left alone. A daemon still running 0.7.8 or older reads the old table, so restart it after the update.
+
 ## 0.7.8 — 2026-11-05
 
 - The output guard sends three more answers about a silence phrase that 0.7.7 silenced: one that opens with a code-quoted phrase (`` `молчу` больше не отправляется в чат.``), one with a single-quoted phrase (`'молчу' …`), and one whose word only starts like a phrase (`Молчун исправлен …`). A straight single quote between letters is an apostrophe and quotes nothing. Codex review of 0.7.7.

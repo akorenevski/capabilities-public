@@ -111,14 +111,14 @@ class ContextInTheStore(unittest.TestCase):
 
     def test_init_on_the_master_is_read_on_a_node(self):
         out = self.master.call("cmd_service_init", None, False)
-        self.assertTrue(any(w.startswith("store:telegrambot_prompts/context@")
+        self.assertTrue(any(w.startswith("store:tgbot_prompts/context@")
                             for w in out["written"]), out)
         self.assertFalse(self.master.service_file().exists(),
                          "the context went into the master's project folder")
         self.assertEqual(self.node.call("_context_body"), TEMPLATE)
         self.assertEqual(self.node.call("cmd_service_context_document"), {"body": TEMPLATE})
         again = self.master.call("cmd_service_init", None, False)
-        self.assertTrue(again["skipped"][-1].startswith("store:telegrambot_prompts/context@"))
+        self.assertTrue(again["skipped"][-1].startswith("store:tgbot_prompts/context@"))
 
     def test_a_new_version_reaches_the_node_at_its_next_turn(self):
         self.master.call("cmd_service_init", None, False)
@@ -179,6 +179,40 @@ class ContextInTheStore(unittest.TestCase):
                 self.assertEqual(self.node.cli._context_or_own_copy(own), "# the daemon's copy\n")
         self.assertIn("keeps its copy", err.getvalue())
         self.assertIn("store_unreachable", err.getvalue())
+
+    def test_a_store_from_before_0_7_9_moves_off_official_telegrambots_names(self):
+        # Up to 0.7.8 the prompts were `telegrambot_prompts` under the owner
+        # `telegrambot`, which official telegrambot's step 0003-prompts creates:
+        # on all-stars (05.11) that step failed on our table.
+        import capabilities_contract.db as db
+        sys.path.insert(0, str(SERVICE_DIR))
+        import prompts as current
+        legacy = current.STORE_STEPS[0][1].split("    DO $$")[0].replace(
+            "tgbot_prompts", "telegrambot_prompts")
+        conn = db.connect(application_name="telegram-bot-test", transaction=True)
+        try:
+            db.migrate(conn, "telegrambot", (("0001-prompts", legacy),), major=1, minor=0)
+            conn.execute("INSERT INTO telegrambot_prompts (project_id, key, body, created_by) "
+                         "VALUES (%s, 'context', '# kept from 0.7.7' || chr(10), 'test')",
+                         (self.project_id,))
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(self.node.call("_context_body"), "# kept from 0.7.7\n")
+        conn = db.connect(application_name="telegram-bot-test", transaction=True)
+        try:
+            gone = conn.execute("SELECT to_regclass('telegrambot_prompts'), "
+                                "to_regprocedure('telegrambot_prompts_guard()')").fetchone()
+            self.assertEqual(gone, (None, None))
+            # Official telegrambot's own names are free: its table keyed by
+            # agent_id is created, and a later migrate leaves it alone.
+            conn.execute("CREATE TABLE telegrambot_prompts (agent_id text, key text)")
+            conn.execute("CREATE FUNCTION telegrambot_prompts_guard() RETURNS trigger "
+                         "LANGUAGE plpgsql AS $$ BEGIN RETURN new; END $$")
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(self.master.call("_context_body"), "# kept from 0.7.7\n")
 
     def test_the_store_is_migrated_once_per_process(self):
         import capabilities_contract.db as db
