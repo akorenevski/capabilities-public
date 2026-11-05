@@ -97,17 +97,25 @@ SILENCE_PHRASE = re.compile(
     r"(?:is )?(?:needed|required|warranted|necessary)|nothing (?:to (?:say|add|reply)|"
     r"worth (?:saying|answering))|not (?:replying|answering) (?:here|to this)"
     r"|промолчу|молчу|не (?:отвечаю|буду отвечать)|отвечать (?:не нужно|незачем|нечего)"
-    r"|ответ не (?:нужен|требуется))", re.I)
+    r"|ответ не (?:нужен|требуется))(?!\w)", re.I)
 SILENCE_LABEL = re.compile(
     r"[\s*_(\[]*(?:silence|silent|no reply|молчу|промолчу|молчание|без ответа)"
     r"[\s*_.!)\]]*", re.I)
 OPENING_CLAUSE = re.compile(r"[^.!?:;\n]*")
 NEGATION = re.compile(r"(?:^|[^\w])(?:не|ни|нет|not|never|no longer|no more)"
                       r"(?![\w])|n't\b", re.I)
-QUOTES = (("«", "»"), ("“", "”"), ("„", "“"), ('"', '"'), ("`", "`"))
+QUOTES = (("«", "»"), ("“", "”"), ("„", "“"), ("‘", "’"), ('"', '"'), ("`", "`"))
+# A straight single quote opens before a word and closes after one; between
+# letters it is an apostrophe (I'll, it's) and quotes nothing.
+SINGLE_OPENING = re.compile(r"(?<!\w)'(?=\w)")
+SINGLE_CLOSING = re.compile(r"(?<=\w)'(?!\w)")
 
 
-def _inside_quotes(before):
+def _inside_quotes(clause, start):
+    before = clause[:start]
+    opened = sum(m.start() < start for m in SINGLE_OPENING.finditer(clause))
+    if opened > len(SINGLE_CLOSING.findall(before)):
+        return True
     for opening, closing in QUOTES:
         if opening == closing:
             if before.count(opening) % 2:
@@ -124,10 +132,10 @@ def silence_announced(text):
     text = text.strip()
     if SILENCE_LABEL.fullmatch(text):
         return True
-    clause = OPENING_CLAUSE.match(text.lstrip(" \t*_>`([")).group(0)
+    clause = OPENING_CLAUSE.match(text.lstrip(" \t*_>([")).group(0)
     for match in SILENCE_PHRASE.finditer(clause):
         before = clause[:match.start()]
-        if not NEGATION.search(before) and not _inside_quotes(before):
+        if not NEGATION.search(before) and not _inside_quotes(clause, match.start()):
             return True
     return False
 

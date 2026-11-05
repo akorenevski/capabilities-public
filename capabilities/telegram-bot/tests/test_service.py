@@ -189,18 +189,33 @@ class Turns(unittest.TestCase):
                 '=== REPLY ===\nFixed: the bot no longer writes "I\'ll stay silent".',
                 "=== REPLY ===\nI'm not staying silent on this: the deploy is broken.",
                 "=== REPLY ===\nThe log ends in silence\nand that is the bug.",
-                "=== REPLY ===\nDone. Nothing to add here."):
+                "=== REPLY ===\nDone. Nothing to add here.",
+                # Codex review of 0.7.7 (05.11): an opening code quote, a
+                # single-quoted phrase, a word that only starts with one.
+                "=== REPLY ===\n'молчу' больше не отправляется в чат.",
+                "=== REPLY ===\nМолчун исправлен, ответы идут."):
             s, api = service(worker=lambda *a, answer=answer: {
                 "ok": True, "answer": answer, "kind": None, "reason": None})
             s.handle_update(update(addressed("status?")))
             self.assertEqual([m["text"] for m in api.sent],
                              [answer.split("\n", 1)[1]], answer)
 
+    def test_guard_sends_a_reply_that_opens_with_a_code_quote(self):
+        # Codex review of 0.7.7: the opening backtick was stripped before the
+        # quote check, so a code-quoted phrase read as an announcement.
+        s, api = service(worker=lambda *a: {
+            "ok": True, "answer": "=== REPLY ===\n`молчу` больше не отправляется в чат.",
+            "kind": None, "reason": None})
+        s.handle_update(update(addressed("status?")))
+        self.assertEqual([m["text"] for m in api.sent],
+                         ["<code>молчу</code> больше не отправляется в чат."])
+
     def test_guard_still_silences_an_announcement_of_silence(self):
         for answer in ("=== REPLY ===\nМолчу.", "=== REPLY ===\n**Промолчу**: не ко мне.",
                        "=== REPLY ===\nНе отвечаю: это для all-stars.",
                        "=== REPLY ===\nNo reply needed.", "=== REPLY ===\n_(no reply)_",
-                       "=== REPLY ===\nStaying silent - not addressed to me."):
+                       "=== REPLY ===\nStaying silent - not addressed to me.",
+                       "=== REPLY ===\nIt's for all-stars, I'll stay quiet."):
             s, api = service(worker=lambda *a, answer=answer: {
                 "ok": True, "answer": answer, "kind": None, "reason": None})
             s.handle_update(update(addressed("status?")))

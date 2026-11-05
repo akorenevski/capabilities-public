@@ -1,5 +1,9 @@
 # telegram-bot — change log
 
+## 0.7.8 — 2026-11-05
+
+- The output guard sends three more answers about a silence phrase that 0.7.7 silenced: one that opens with a code-quoted phrase (`` `молчу` больше не отправляется в чат.``), one with a single-quoted phrase (`'молчу' …`), and one whose word only starts like a phrase (`Молчун исправлен …`). A straight single quote between letters is an apostrophe and quotes nothing. Codex review of 0.7.7.
+
 ## 0.7.7 — 2026-11-05
 
 - The output guard silences only a reply that is itself an announcement of silence: its opening clause says it stays silent, unquoted and not negated, or the whole reply is a silence label. A reply that quotes or negates such a phrase goes out («Исправлено: бот больше не пишет «молчу».» was sent by 0.7.5 and silenced by 0.7.6). A silence label in markup (`_(no reply)_`) is now silence too.
