@@ -177,6 +177,35 @@ class Turns(unittest.TestCase):
             self.assertEqual([m["text"] for m in api.sent],
                              [answer.split("\n", 1)[1]], answer)
 
+    def test_guard_sends_a_reply_that_quotes_or_negates_silence(self):
+        # Codex review of 0.7.6 (05.11): a reply about a silence phrase is an
+        # answer, not an announcement; 0.7.5 sent these, 0.7.6 dropped them.
+        for answer in (
+                "=== REPLY ===\nИсправлено: бот больше не пишет «молчу».",
+                "=== REPLY ===\nБот больше не пишет «промолчу» в чат.",
+                "=== REPLY ===\nСлово «молчу» из ответов убрано.",
+                "=== REPLY ===\nЯ не молчу — вот ответ: всё зелёное.",
+                "=== REPLY ===\nСделал.\nТеперь бот не пишет «без ответа» в конце.",
+                '=== REPLY ===\nFixed: the bot no longer writes "I\'ll stay silent".',
+                "=== REPLY ===\nI'm not staying silent on this: the deploy is broken.",
+                "=== REPLY ===\nThe log ends in silence\nand that is the bug.",
+                "=== REPLY ===\nDone. Nothing to add here."):
+            s, api = service(worker=lambda *a, answer=answer: {
+                "ok": True, "answer": answer, "kind": None, "reason": None})
+            s.handle_update(update(addressed("status?")))
+            self.assertEqual([m["text"] for m in api.sent],
+                             [answer.split("\n", 1)[1]], answer)
+
+    def test_guard_still_silences_an_announcement_of_silence(self):
+        for answer in ("=== REPLY ===\nМолчу.", "=== REPLY ===\n**Промолчу**: не ко мне.",
+                       "=== REPLY ===\nНе отвечаю: это для all-stars.",
+                       "=== REPLY ===\nNo reply needed.", "=== REPLY ===\n_(no reply)_",
+                       "=== REPLY ===\nStaying silent - not addressed to me."):
+            s, api = service(worker=lambda *a, answer=answer: {
+                "ok": True, "answer": answer, "kind": None, "reason": None})
+            s.handle_update(update(addressed("status?")))
+            self.assertEqual(api.sent, [], answer)
+
     def test_redelivered_update_is_answered_once(self):
         s, api = service()
         u = update(addressed())

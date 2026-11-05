@@ -86,16 +86,54 @@ TOOL_OUTPUT = re.compile(
     r"</?(?:antml:)?(?:function_calls|invoke|parameter|function_results|tool_use|tool_result"
     r"|tool_call|system-reminder)\b|^[ \t]*(?:\[?(?:Tool (?:call|result|output)|Tool:|"
     r"Called tool|Bash\(|Read\(|Edit\(|Write\())", re.M | re.I)
-SILENCE_EXPLAINED = re.compile(
+
+# Ours: a silence that talked is a reply that is itself the announcement - its
+# opening clause says it stays silent, or the whole reply is a silence label. A
+# reply that quotes or negates such a phrase is an answer about it and goes out
+# («Исправлено: бот больше не пишет «молчу».», Codex review of 0.7.6, 05.11).
+SILENCE_PHRASE = re.compile(
     r"\b(?:I(?:'ll| will| am going to|'m going to)? (?:stay|remain|keep) (?:silent|quiet)"
     r"|(?:staying|remaining|keeping) (?:silent|quiet)|no (?:reply|answer|response) "
     r"(?:is )?(?:needed|required|warranted|necessary)|nothing (?:to (?:say|add|reply)|"
-    r"worth (?:saying|answering)) (?:here|now)?\s*[.)\]]*\s*$|not (?:replying|answering)"
-    r" (?:here|to this))|(?:^|[\s(\[])(?:silence|silent|no reply|молчу|промолчу|"
-    r"молчание|без ответа)[.)\]]*\s*$|\b(?:промолчу|молчу|не (?:отвечаю|буду отвечать)|"
-    r"отвечать (?:не нужно|незачем|нечего)|ответ не (?:нужен|требуется))", re.I | re.M)
-WITHHELD = (("hand-off", HANDOFF_LINE), ("tool output", TOOL_OUTPUT),
-            ("silence explained", SILENCE_EXPLAINED))
+    r"worth (?:saying|answering))|not (?:replying|answering) (?:here|to this)"
+    r"|промолчу|молчу|не (?:отвечаю|буду отвечать)|отвечать (?:не нужно|незачем|нечего)"
+    r"|ответ не (?:нужен|требуется))", re.I)
+SILENCE_LABEL = re.compile(
+    r"[\s*_(\[]*(?:silence|silent|no reply|молчу|промолчу|молчание|без ответа)"
+    r"[\s*_.!)\]]*", re.I)
+OPENING_CLAUSE = re.compile(r"[^.!?:;\n]*")
+NEGATION = re.compile(r"(?:^|[^\w])(?:не|ни|нет|not|never|no longer|no more)"
+                      r"(?![\w])|n't\b", re.I)
+QUOTES = (("«", "»"), ("“", "”"), ("„", "“"), ('"', '"'), ("`", "`"))
+
+
+def _inside_quotes(before):
+    for opening, closing in QUOTES:
+        if opening == closing:
+            if before.count(opening) % 2:
+                return True
+        elif before.count(opening) > before.count(closing):
+            return True
+    return False
+
+
+def silence_announced(text):
+    """True when the reply announces its own silence rather than answering:
+    its opening clause carries a silence phrase that no negation precedes and
+    no quote holds, or the whole reply is a silence label («(silence)»)."""
+    text = text.strip()
+    if SILENCE_LABEL.fullmatch(text):
+        return True
+    clause = OPENING_CLAUSE.match(text.lstrip(" \t*_>`([")).group(0)
+    for match in SILENCE_PHRASE.finditer(clause):
+        before = clause[:match.start()]
+        if not NEGATION.search(before) and not _inside_quotes(before):
+            return True
+    return False
+
+
+WITHHELD = (("hand-off", HANDOFF_LINE.search), ("tool output", TOOL_OUTPUT.search),
+            ("silence explained", silence_announced))
 
 
 def cut_reply(reply):
@@ -111,8 +149,8 @@ def cut_reply(reply):
     after = reply[matches[-1].end():].strip()
     if not after:
         return "", "mislabelled"
-    for kind, pattern in WITHHELD:
-        if pattern.search(after):
+    for kind, found in WITHHELD:
+        if found(after):
             return "", f"withheld: {kind}"
     return after, "marked"
 

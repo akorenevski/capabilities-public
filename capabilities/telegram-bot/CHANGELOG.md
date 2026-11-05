@@ -1,5 +1,9 @@
 # telegram-bot — change log
 
+## 0.7.7 — 2026-11-05
+
+- The output guard silences only a reply that is itself an announcement of silence: its opening clause says it stays silent, unquoted and not negated, or the whole reply is a silence label. A reply that quotes or negates such a phrase goes out («Исправлено: бот больше не пишет «молчу».» was sent by 0.7.5 and silenced by 0.7.6). A silence label in markup (`_(no reply)_`) is now silence too.
+
 ## 0.7.6 — 2026-11-05
 
 - Output guard: only the text under a `=== REPLY ===` marker reaches a chat. An answer with no marker is silence, as is one whose text under the marker carries a ▶ hand-off line, tool output, or an explanation of staying silent; an empty answer is silence. Live 2026-10-25, @aspects_allstars_bot #3272 in Blues Bros topic 141 posted its reasoning and the marker; Alexander 28.10: never again. The turn's delivery line says so on every turn; the shipped context template says so too, and a project whose `context` prompt is already in the store keeps its old wording until it is put again (`prompts put`).
