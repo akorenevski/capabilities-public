@@ -36,7 +36,7 @@ SHIM = SERVICE_DIR / "worker-bin" / "telegram-bot"
 
 
 def ok(answer="ok"):
-    return {"ok": True, "answer": answer, "kind": None, "reason": None}
+    return {"ok": True, "answer": "=== REPLY ===\n" + answer, "kind": None, "reason": None}
 
 
 def with_bob(cfg=None, **entry):

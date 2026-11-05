@@ -81,7 +81,7 @@ def real_service(answer: str):
     api.get_me = lambda: dict(ME)
 
     def worker(prompt, tail, knobs, cwd, cancel):
-        return {"ok": True, "answer": answer, "kind": None, "reason": None}
+        return {"ok": True, "answer": "=== REPLY ===\n" + answer, "kind": None, "reason": None}
     s, _ = service(worker=worker, api=api)
     return s, tg
 

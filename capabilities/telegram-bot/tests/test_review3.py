@@ -42,7 +42,7 @@ GUIDE = Path(os.environ.get("TELEGRAM_BOT_GUIDES_DIR") or CAPABILITY_DIR / "guid
 
 
 def ok(answer="ok"):
-    return {"ok": True, "answer": answer, "kind": None, "reason": None}
+    return {"ok": True, "answer": "=== REPLY ===\n" + answer, "kind": None, "reason": None}
 
 
 def with_bob(cfg=None, **entry):

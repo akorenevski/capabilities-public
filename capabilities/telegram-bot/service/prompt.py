@@ -10,7 +10,7 @@ The prompt follows upstream `telegram`'s `build_prompt` in shape - the
 project's context file, the channel state, the current request, then the
 conversation - trimmed to what a bot knows. The reply marker and its cut are
 upstream's (`REPLY_MARKER_LINE`, `cut_at_reply_marker`), carried unchanged; the
-daemon, unlike upstream, sends nothing for a marker with nothing under it.
+daemon, unlike upstream, sends only what stands under a marker (`cut_reply`).
 
 Message text is the one part of the prompt a stranger writes, so it is fenced
 as upstream fences it: a line opening with `---` is indented (`_quoted`), so a
@@ -76,16 +76,44 @@ def cut_at_reply_marker(reply):
 LOOSE_REPLY_MARKER = re.compile(r"\**[ \t]*===[ \t]*REPLY[ \t]*===[ \t]*\**[ \t]*:?")
 
 
+# Ours: what may still stand under the marker and never reaches a chat (live
+# 2026-10-25, @aspects_allstars_bot #3272 in topic 141; Alexander 28.10 «чтобы
+# больше никогда»). A ▶ hand-off line is one agent passing work to another; tool
+# output is a harness's call or result block; an explanation of staying silent
+# is a silence that talked. Any of them withholds the whole answer.
+HANDOFF_LINE = re.compile(r"^[ \t*_>`]*▶", re.M)
+TOOL_OUTPUT = re.compile(
+    r"</?(?:antml:)?(?:function_calls|invoke|parameter|function_results|tool_use|tool_result"
+    r"|tool_call|system-reminder)\b|^[ \t]*(?:\[?(?:Tool (?:call|result|output)|Tool:|"
+    r"Called tool|Bash\(|Read\(|Edit\(|Write\())", re.M | re.I)
+SILENCE_EXPLAINED = re.compile(
+    r"\b(?:I(?:'ll| will| am going to|'m going to)? (?:stay|remain|keep) (?:silent|quiet)"
+    r"|(?:staying|remaining|keeping) (?:silent|quiet)|no (?:reply|answer|response) "
+    r"(?:is )?(?:needed|required|warranted|necessary)|nothing (?:to (?:say|add|reply)|"
+    r"worth (?:saying|answering)) (?:here|now)?\s*[.)\]]*\s*$|not (?:replying|answering)"
+    r" (?:here|to this))|(?:^|[\s(\[])(?:silence|silent|no reply|молчу|промолчу|"
+    r"молчание|без ответа)[.)\]]*\s*$|\b(?:промолчу|молчу|не (?:отвечаю|буду отвечать)|"
+    r"отвечать (?:не нужно|незачем|нечего)|ответ не (?:нужен|требуется))", re.I | re.M)
+WITHHELD = (("hand-off", HANDOFF_LINE), ("tool output", TOOL_OUTPUT),
+            ("silence explained", SILENCE_EXPLAINED))
+
+
 def cut_reply(reply):
-    """`(text, outcome)` like `cut_at_reply_marker`, but the marker is found in
-    any of the shapes `LOOSE_REPLY_MARKER` knows, and a marker with nothing under
-    it is silence. A reply with no marker at all goes out as it is."""
+    """`(text, outcome)` for what of a worker's answer reaches the chat: only
+    the text under the last marker, found in any shape `LOOSE_REPLY_MARKER`
+    knows. Everything else is silence: no marker (`unmarked`, the answer is
+    working-out), a marker with nothing under it (`mislabelled`), and text under
+    it that carries a ▶ hand-off line, tool output or an explanation of staying
+    silent (`withheld: <kind>`)."""
     matches = list(LOOSE_REPLY_MARKER.finditer(reply))
     if not matches:
-        return reply, "unmarked"
+        return "", "unmarked"
     after = reply[matches[-1].end():].strip()
     if not after:
         return "", "mislabelled"
+    for kind, pattern in WITHHELD:
+        if pattern.search(after):
+            return "", f"withheld: {kind}"
     return after, "marked"
 
 
@@ -254,9 +282,9 @@ def build_prompt(context: str, state: dict, tail: list[dict]) -> str:
     lines.append("Delivery: the daemon sends your final answer "
                  + ("top-level (the request came from a bot)" if request.get("agent")
                     else "as a reply to the request message")
-                 + ", in the same topic. An empty answer sends nothing. To keep your "
-                 f"working-out out of the chat, write a line `{REPLY_MARKER_LINE}` and put "
-                 "only the message below it.")
+                 + ", in the same topic. Only the text below a line "
+                 f"`{REPLY_MARKER_LINE}` is sent; an answer without that line, or with "
+                 "nothing below it, sends nothing.")
     if state.get("progress_command"):
         lines.append(f"Progress command: {state['progress_command']} \"<one short line>\"")
     if state.get("restricted"):
