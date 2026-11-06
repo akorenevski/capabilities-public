@@ -68,12 +68,12 @@ PERSON_KEYS = {"name", "username", "role", "kind", "may_address"} | GRANT_KEYS
 USER_KEYS = PERSON_KEYS | {"profile", "brief", "worker_timeout", "tail_size"}
 MEMBER_KEYS = PERSON_KEYS
 ROOM_KEYS = {"name", "profile", "restricted_profile", "brief", "worker_timeout", "tail_size",
-             "agent_dialogue", "rate_limit", "triggers", "debounce"}
+             "agent_dialogue", "rate_limit", "triggers", "debounce", "progress"}
 TOPIC_KEYS = ROOM_KEYS
 GROUP_KEYS = ROOM_KEYS | GRANT_KEYS | {"role", "member_role", "members", "topics"}
 DEFAULTS_KEYS = {"profile", "restricted_profile", "tail_size", "worker_timeout",
                  "poll_timeout", "max_parallel", "progress_after", "agent_dialogue",
-                 "rate_limit", "debounce"}
+                 "rate_limit", "debounce", "progress"}
 AGENT_DIALOGUE_KEYS = {"max_turns", "reset_on_human_message"}
 RATE_LIMIT_KEYS = {"replies_per_minute", "replies_per_minute_total"}
 AUTHORITY_KEYS = {"default", "roles"}
@@ -204,6 +204,8 @@ class _Check:
                 self.string(block[key], f"{where}.{key}")
         if "brief" in block:
             self.string(block["brief"], f"{where}.brief", nonempty=False)
+        if "progress" in block:
+            self.boolean(block["progress"], f"{where}.progress")
         if "triggers" in block:
             triggers = block["triggers"]
             if not isinstance(triggers, list) or any(t not in TRIGGER_NAMES for t in triggers):

@@ -1462,8 +1462,10 @@ class Service:
     def _companion(self, decision: dict, target: dict, files: dict, stop: threading.Event,
                    after) -> None:
         """For the length of a turn: "typing" kept up, and the worker's progress
-        lines relayed, the first at once and the rest throttled."""
+        lines relayed, the first at once and the rest throttled; none where the
+        room's `progress` is false."""
         throttle = ProgressThrottle(after)
+        quiet = _mapping(decision.get("policy")).get("progress") is False
         relayed = 0
         read = 0
         next_typing = 0.0
@@ -1486,7 +1488,9 @@ class Service:
                     text = str(json.loads(line).get("text") or "").strip()
                 except (ValueError, AttributeError):
                     continue
-                if text and relayed >= PROGRESS_LIMIT:
+                if text and quiet:
+                    log(f"{decision['key']}: progress held back, off in this room: {text[:80]}")
+                elif text and relayed >= PROGRESS_LIMIT:
                     log(f"{decision['key']}: progress held back, {PROGRESS_LIMIT} lines "
                         f"already this turn: {text[:80]}")
                 elif text and throttle.allows():
@@ -1534,7 +1538,8 @@ class Service:
                  "chat_title": chat.get("title"), "topic_id": decision.get("topic_id"),
                  "topic_name": policy.get("name") if decision.get("topic_id") else None,
                  "agent_dialogue": decision.get("dialogue"), "brief": policy.get("brief"),
-                 "progress_command": None if restricted else "telegram-bot progress",
+                 "progress_command": (None if restricted or policy.get("progress") is False
+                                      else "telegram-bot progress"),
                  "restricted": restricted,
                  "authority": authority.summary(ctx), "other_requests": waiting,
                  "request": {"message_id": decision["message_id"],

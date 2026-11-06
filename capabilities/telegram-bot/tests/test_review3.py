@@ -545,6 +545,25 @@ class Minors(unittest.TestCase):
         steps = [m["text"] for m in api.sent if m["text"].startswith("step")]
         self.assertEqual(len(steps), daemon.PROGRESS_LIMIT)
 
+    def test_progress_false_sends_no_progress_line(self):
+        holder = {}
+
+        def worker(prompt, tail, knobs, cwd, cancel):
+            holder["prompt"] = prompt
+            outbox = next(iter(holder["s"].turn_files.values()))["outbox"]
+            with open(outbox, "a") as fh:
+                fh.write(json.dumps({"text": "step 0"}) + "\n")
+            time.sleep(0.3)
+            return ok("done")
+        cfg = settings(defaults={"profile": "stub", "progress_after": 0, "progress": False})
+        with mock.patch.object(daemon, "PROGRESS_POLL", 0.02):
+            s, api = service(cfg, worker=worker)
+            holder["s"] = s
+            s.handle_update(update(addressed()))
+        self.assertEqual([m["text"] for m in api.sent if m["text"].startswith("step")], [])
+        self.assertNotIn("Progress command", holder["prompt"])
+        self.assertTrue(any("done" in m["text"] for m in api.sent))
+
     def test_leftover_turn_files_are_cleared_and_the_folder_is_private(self):
         turns = self.scratch / "turns"
         turns.mkdir()

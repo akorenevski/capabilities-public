@@ -1,5 +1,9 @@
 # telegram-bot — change log
 
+## 0.7.10 — 2026-11-06
+
+- `progress: false` in a group, a topic or `defaults` turns progress lines off there: the worker is offered no progress command and the daemon relays none, so each message gets one answer. A room with people who are not the team no longer sees a "Looking…" line before every reply.
+
 ## 0.7.9 — 2026-11-05
 
 - The prompts move off the names official `telegrambot` takes: the table is `tgbot_prompts` under the ledger owner `tgbot`, no longer `telegrambot_prompts` under `telegrambot`. The first open of a store moves every version from the old table, keeping ids, dates and the active one, and drops the old table and its guard function, so official `telegrambot`'s step `0003-prompts` can run on the same store (it failed on all-stars, 05.11). A `telegrambot_prompts` keyed by `agent_id` is official telegrambot's own and is left alone. A daemon still running 0.7.8 or older reads the old table, so restart it after the update.

@@ -71,11 +71,13 @@ direct_messages {mode (allowed_users|anyone|off), default_role}, allowed_users
 tail_size, control, authority}}, allowed_groups {<chat id>: {name, role,
 member_role, members {<id>: {name, role, kind, may_address, control, authority}},
 triggers [username, reply, command], topics {<topic id>: {name, profile, brief,
-...}}, profile, brief, agent_dialogue, rate_limit, control, authority}}, control
+...}}, profile, brief, progress, agent_dialogue, rate_limit, control, authority}}, control
 {roles {<role>: {commands}}}, authority {default, roles {<role>:
 {allowed_capabilities}}}, defaults {profile, worker_timeout, tail_size,
-max_parallel, poll_timeout, progress_after, debounce, agent_dialogue {max_turns,
+max_parallel, poll_timeout, progress_after, progress, debounce, agent_dialogue {max_turns,
 reset_on_human_message}, rate_limit {replies_per_minute, replies_per_minute_total}}.
+`progress: false` in a group, topic or defaults: no progress lines there, one answer
+per message (the worker is offered no progress command and the daemon relays none).
 A bot answers only when addressed - @username, a reply to it, /command@username - in
 an allowed place by an allowed sender; another bot's bare reply is context, not a
 turn; a message ending in a `#noreply` line is never a turn, and the answers to one
