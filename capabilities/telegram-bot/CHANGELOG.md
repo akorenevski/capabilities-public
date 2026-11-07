@@ -1,5 +1,9 @@
 # telegram-bot — change log
 
+## 0.7.11 — 2026-11-07
+
+- The prompt table's owner `tgbot` is declared: the manifest says `tables: true` and names `owners: ["tgbot"]`, and `telegram-bot migrate [status]` migrates or reports it, so `capabilities store upgrade` finds a release that moves those tables and is no longer stopped by `owner_not_installed` for `tgbot`. Its steps, rows and guard are unchanged.
+
 ## 0.7.10 — 2026-11-06
 
 - `progress: false` in a group, a topic or `defaults` turns progress lines off there: the worker is offered no progress command and the daemon relays none, so each message gets one answer. A room with people who are not the team no longer sees a "Looking…" line before every reply.
