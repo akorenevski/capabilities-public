@@ -4,17 +4,16 @@
       "icon": false,
       "path": "capabilities/my-notion",
       "payload_sha256": "ad3e737aebe1c213b98650eef801a3962789e68ae333df71ded3bda993dae370",
-      "store_major": 1,
+      "store_major": 2,
       "summary": "Notion CLI over the REST API — pages AND databases. Publish markdown, create/upsert pages; create databases, add/query/update rows (data-source model, 2026-03-11), and archive. Personal, multi-workspace."
     },
     "telegram-bot": {
       "icon": false,
       "path": "capabilities/telegram-bot",
       "payload_sha256": "21b65b1cd55ef7aa2ecd944a35ba89586743458fe7e72916b35e79809e27bef4",
-      "store_major": 1,
+      "store_major": 2,
       "summary": "One Telegram bot per project: the project's agent answers in allowed chats and forum topics when addressed (mention, reply, /command@bot), with a bot-to-bot loop guard. Bot API; derived from upstream telegram."
     }
   },
-  "library": ">=0.42,<0.43",
-  "store_major": 1
+  "store_major": 2
 }
